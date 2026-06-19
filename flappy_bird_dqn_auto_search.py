@@ -643,13 +643,23 @@ def check_early_stop(train_frames, best_eval_score, best_train_score,
 # 10. Failure Penalty Objective (Section 9.4)
 # ============================================================================
 def compute_objective(success, train_raw_env_frames, max_trial_frames, best_eval_score):
-    """Compute optimization objective that incorporates failure information."""
+    """Optuna minimizes this objective.
+
+    Successful trials are ranked by training frames to stable 1000 score.
+    Failed trials receive a large penalty, but better near-misses get a
+    slightly smaller penalty so TPE can still learn from them.
+    """
     if success:
         return float(train_raw_env_frames)
 
-    progress_score = min(best_eval_score / 1000.0, 1.0)
-    penalty_factor = 2.0 - 0.9 * progress_score
-    return float(max_trial_frames) * penalty_factor
+    try:
+        best_eval_score = float(best_eval_score)
+    except (TypeError, ValueError):
+        best_eval_score = 0.0
+    if math.isnan(best_eval_score) or best_eval_score < 0:
+        best_eval_score = 0.0
+
+    return float(max_trial_frames * 10 - best_eval_score)
 
 
 # ============================================================================
@@ -965,6 +975,72 @@ def generate_summary(history, top_k=5):
         print(f"Top {idx}: trial={row['trial_id']}  obj={row['objective']}  "
               f"median={row['median_score']}  sr={row['success_rate_1000']}")
     return summary
+
+
+# ============================================================================
+# Top-K Recheck (P1-2: Minimal implementation)
+# ============================================================================
+def recheck_top_k(history, k=5, recheck_seeds=(101, 202, 303),
+                  max_trial_frames=1_000_000, eval_episodes=20):
+    """Re-evaluate top K configs with multiple independent seeds."""
+    top_configs = history.top_k(k)
+    results = []
+
+    for rank, trial in enumerate(top_configs):
+        config = trial.get('config', {})
+        if not config:
+            continue
+        seed_scores = []
+        for seed in recheck_seeds:
+            result = run_trial(
+                config=config, trial_id=-1, seed=seed, source='recheck',
+                max_trial_frames=max_trial_frames,
+                eval_episodes=eval_episodes,
+            )
+            seed_scores.append({
+                'seed': seed,
+                'status': result['status'],
+                'train_raw_env_frames': result['train_raw_env_frames'],
+                'median_score': result['median_score'],
+                'success_rate_1000': result['success_rate_1000'],
+            })
+
+        all_seed_scores = [s['median_score'] for s in seed_scores]
+        successful_train_frames = [
+            s['train_raw_env_frames'] for s in seed_scores
+            if s['status'] == 'success'
+        ]
+
+        recheck_summary = {
+            'rank': rank + 1,
+            'original_trial_id': trial.get('trial_id'),
+            'config': config,
+            'seeds': seed_scores,
+            'recheck_median': float(np.median(all_seed_scores)),
+            'recheck_mean': float(np.mean(all_seed_scores)),
+            'recheck_success_rate': float(np.mean([s['success_rate_1000'] for s in seed_scores])),
+            'p10_score': float(np.percentile(all_seed_scores, 10)),
+            'p90_score': float(np.percentile(all_seed_scores, 90)),
+            'score_std': float(np.std(all_seed_scores)),
+            'median_train_raw_env_frames_to_stable_1000': (
+                float(np.median(successful_train_frames)) if successful_train_frames else None
+            ),
+            'recheck_passed': all(s['status'] == 'success' for s in seed_scores),
+            'failed_seeds': [s for s in seed_scores if s['status'] != 'success'],
+        }
+        results.append(recheck_summary)
+
+        recheck_record = {
+            'record_type': 'recheck',
+            'trial_id': trial.get('trial_id'),
+            'recheck_passed': recheck_summary['recheck_passed'],
+            'recheck_median': recheck_summary['recheck_median'],
+            'recheck_success_rate': recheck_summary['recheck_success_rate'],
+            'recheck_seeds_used': list(recheck_seeds),
+        }
+        history.append(recheck_record)
+
+    return results
 
 
 # ============================================================================
