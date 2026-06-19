@@ -650,3 +650,395 @@ def compute_objective(success, train_raw_env_frames, max_trial_frames, best_eval
     progress_score = min(best_eval_score / 1000.0, 1.0)
     penalty_factor = 2.0 - 0.9 * progress_score
     return float(max_trial_frames) * penalty_factor
+
+
+# ============================================================================
+# 11. Search Space — Optuna parameter definition (Section 10.6)
+# ============================================================================
+def define_search_space(trial):
+    """Define MVP 8-parameter search space.
+    Uses scalar categorical choices for Optuna SQLite persistence,
+    then maps to actual layer size lists.
+    """
+    hidden_map = {
+        'small': [64, 32],
+        'medium': [128, 64],
+        'large': [256, 128],
+    }
+    hidden_key = trial.suggest_categorical('hidden_key', ['small', 'medium', 'large'])
+    return {
+        # Searchable (Section 10.6)
+        'lr': trial.suggest_float('lr', 1e-5, 3e-3, log=True),
+        'gamma': trial.suggest_float('gamma', 0.90, 0.999),
+        'hidden_key': hidden_key,
+        'hidden': hidden_map[hidden_key],
+        'eps_start': trial.suggest_float('eps_start', 0.01, 0.15),
+        'eps_end': trial.suggest_float('eps_end', 0.001, 0.02),
+        'eps_decay_decision_steps': trial.suggest_int('eps_decay_decision_steps', 10000, 200000),
+        'replay_start_size': trial.suggest_categorical('replay_start_size', [1000, 5000, 10000]),
+        'train_freq': trial.suggest_categorical('train_freq', [1, 4]),
+        # MVP fixed (Section 10.3, 10.4)
+        'double_q': True,
+        'n_step': 1,
+        'frame_skip': 1,
+        'target_update_mode': 'soft',
+        'tau': 0.005,
+        'torch_optimizer': 'Adam',
+        'loss_type': 'Huber',
+        'grad_clip_norm': 5,
+        'batch_sz': 64,
+        'buffer_sz': 50000,
+        'reward_pipe': 1.0,
+        'reward_death': -1.0,
+        'reward_alive': 0.0,
+        'reward_clip': None,
+        'reward_scale': 1.0,
+    }
+
+
+# ============================================================================
+# 12. History Manager — JSONL persistence (Section 14)
+# ============================================================================
+def _make_serializable(obj):
+    """Convert numpy / torch objects to JSON-serializable Python values."""
+    if isinstance(obj, dict):
+        return {k: _make_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_make_serializable(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu().tolist()
+    if isinstance(obj, Path):
+        return str(obj)
+    return obj
+
+
+class HistoryManager:
+    """Append-only JSONL history for trial results."""
+
+    def __init__(self, history_path='search_history.jsonl'):
+        self.path = Path(history_path)
+
+    def append(self, result):
+        with open(self.path, 'a', encoding='utf-8') as f:
+            serializable = dict(_make_serializable(result))
+            serializable.setdefault('record_type', 'trial')
+            f.write(json.dumps(serializable, ensure_ascii=False) + '\n')
+            f.flush()
+
+    def load(self):
+        if not self.path.exists():
+            return []
+        rows = []
+        with open(self.path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        rows.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+        return rows
+
+    def success_count(self):
+        return sum(
+            1 for r in self.load()
+            if r.get('record_type', 'trial') == 'trial' and r.get('status') == 'success'
+        )
+
+    def failure_count(self):
+        return sum(
+            1 for r in self.load()
+            if r.get('record_type', 'trial') == 'trial' and r.get('status') == 'failure'
+        )
+
+    def best_trial(self):
+        rows = [r for r in self.load() if r.get('record_type', 'trial') == 'trial']
+        successes = [r for r in rows if r.get('status') == 'success']
+        if successes:
+            return min(successes, key=lambda r: r.get('objective', float('inf')))
+        if rows:
+            return min(rows, key=lambda r: r.get('objective', float('inf')))
+        return None
+
+    def top_k(self, k=5):
+        """P1-3: Sort by Section 16.2 priority rules. Filter trial records only."""
+        rows = [
+            r for r in self.load()
+            if r.get('record_type', 'trial') == 'trial'
+            and r.get('config')
+        ]
+
+        def ranking_key(r):
+            return (
+                not r.get('recheck_passed', False),
+                r.get('median_train_raw_env_frames_to_stable_1000',
+                      r.get('objective', float('inf'))),
+                -r.get('success_rate_1000', 0),
+                -r.get('median_score', 0),
+                r.get('total_raw_env_frames', float('inf')),
+            )
+
+        sorted_rows = sorted(rows, key=ranking_key)
+        return sorted_rows[:k]
+
+
+# ============================================================================
+# 13. Search Driver — P0-4/P0-5 fixes
+# ============================================================================
+class SearchDriver:
+    """Orchestrates the full hyperparameter search with Optuna TPE."""
+
+    def __init__(self, history_path='search_history.jsonl', study_db='optuna_study.db',
+                 max_trials=100, max_trial_frames=1_000_000,
+                 eval_interval_frames=20_000, eval_episodes=5,
+                 candidate_verify_episodes=20, n_startup_trials=30,
+                 seed_pool=(11, 22, 33)):
+        self.history = HistoryManager(history_path)
+        self.study_db = study_db
+        self.max_trials = max_trials
+        self.max_trial_frames = max_trial_frames
+        self.eval_interval_frames = eval_interval_frames
+        self.eval_episodes = eval_episodes
+        self.candidate_verify_episodes = candidate_verify_episodes
+        self.n_startup_trials = n_startup_trials
+        self.seed_pool = list(seed_pool)
+        self._interrupted = False
+
+    def _objective(self, trial):
+        """Optuna objective. P0-5: trial_id = trial.number."""
+        config = define_search_space(trial)
+        trial_id = trial.number
+        seed = self.seed_pool[trial_id % len(self.seed_pool)]
+
+        print(f"\n{'=' * 50}")
+        print(f"Trial #{trial_id}  |  Source: TPE  |  Seed: {seed}")
+        print(f"Config: lr={config['lr']:.2e}, gamma={config['gamma']:.4f}, "
+              f"hidden={config['hidden']}, eps={config['eps_start']:.3f}->{config['eps_end']:.3f} "
+              f"over {config['eps_decay_decision_steps']} steps")
+        print(f"{'=' * 50}")
+
+        result = run_trial(
+            config=config, trial_id=trial_id, seed=seed, source='tpe',
+            max_trial_frames=self.max_trial_frames,
+            eval_interval_frames=self.eval_interval_frames,
+            eval_episodes=self.eval_episodes,
+            candidate_verify_episodes=self.candidate_verify_episodes,
+        )
+
+        obj = compute_objective(
+            success=(result['status'] == 'success'),
+            train_raw_env_frames=result['train_raw_env_frames'],
+            max_trial_frames=self.max_trial_frames,
+            best_eval_score=result['best_eval_score'],
+        )
+        result['objective'] = obj
+
+        self.history.append(result)
+
+        if result['status'] == 'success':
+            print(f"SUCCESS Trial #{trial_id}  train_frames={result['train_raw_env_frames']}  "
+                  f"median={result['median_score']:.0f}  sr={result['success_rate_1000']:.0%}")
+        else:
+            print(f"FAILED Trial #{trial_id}  reason={result['failure_reason']}  "
+                  f"best_eval={result['best_eval_score']:.0f}  objective={obj:.0f}")
+
+        if self._interrupted:
+            trial.study.stop()
+
+        return obj
+
+    def run(self):
+        if optuna is None:
+            raise ImportError('optuna required. Install: pip install optuna')
+
+        study = optuna.create_study(
+            study_name='flappy_bird_dqn_search',
+            storage=f'sqlite:///{self.study_db}',
+            direction='minimize',
+            sampler=optuna.samplers.TPESampler(n_startup_trials=self.n_startup_trials, seed=42),
+            load_if_exists=True,
+        )
+
+        existing = len(study.trials)
+        remaining = max(0, self.max_trials - existing)
+
+        # Baseline as independent sanity check
+        history_rows = self.history.load()
+        has_baseline = any(r.get('source') == 'baseline' for r in history_rows)
+
+        if existing == 0 and not has_baseline:
+            print(f"\n[STAGE 0] Baseline verification (independent, not counted in max_trials)...")
+            result = run_trial(
+                config=dict(BASELINE_CONFIG), trial_id=-1, seed=11, source='baseline',
+                max_trial_frames=self.max_trial_frames,
+                eval_interval_frames=self.eval_interval_frames,
+                eval_episodes=self.eval_episodes,
+                candidate_verify_episodes=self.candidate_verify_episodes,
+            )
+            obj = compute_objective(
+                success=(result['status'] == 'success'),
+                train_raw_env_frames=result['train_raw_env_frames'],
+                max_trial_frames=self.max_trial_frames,
+                best_eval_score=result['best_eval_score'],
+            )
+            result['objective'] = obj
+            self.history.append(result)
+            print(f"[STAGE 0] Baseline complete. status={result['status']}\n")
+
+        print(f"[INFO] Study: {existing} Optuna trials completed, {remaining} remaining")
+        print(f"[INFO] Max trial frames: {self.max_trial_frames}")
+
+        original_handler = signal.signal(signal.SIGINT, self._sigint_handler)
+
+        try:
+            study.optimize(self._objective, n_trials=remaining)
+        finally:
+            signal.signal(signal.SIGINT, original_handler)
+
+        if self._interrupted:
+            print("\n[Ctrl+C] Search stopped by user. History saved.")
+
+        generate_summary(self.history)
+
+    def _sigint_handler(self, signum, frame):
+        """P0-4: Set flag only. Let current trial finish, then stop."""
+        print("\n[Ctrl+C] Will stop after current trial completes. Press again to force-quit.")
+        if self._interrupted:
+            print("[Ctrl+C] Force quitting...")
+            sys.exit(1)
+        self._interrupted = True
+
+
+# ============================================================================
+# 14. Reporting — console summary + structured return value
+# ============================================================================
+def generate_summary(history, top_k=5):
+    """Print a compact summary and return it as a dict for tests."""
+    rows = history.load()
+    trial_rows = [r for r in rows if r.get('record_type', 'trial') == 'trial']
+
+    if not trial_rows:
+        summary = {
+            'trial_count': 0, 'success_count': 0, 'failure_count': 0,
+            'best_trial_id': None, 'best_objective': None,
+            'top_k': [], 'failure_reasons': {},
+        }
+        print('[SUMMARY] No trial records found.')
+        return summary
+
+    failure_reasons = {}
+    for row in trial_rows:
+        if row.get('status') == 'failure':
+            reason = row.get('failure_reason') or 'unknown'
+            failure_reasons[reason] = failure_reasons.get(reason, 0) + 1
+
+    best = history.best_trial()
+    top_trials = history.top_k(top_k)
+    summary = {
+        'trial_count': len(trial_rows),
+        'success_count': history.success_count(),
+        'failure_count': history.failure_count(),
+        'best_trial_id': best.get('trial_id') if best else None,
+        'best_objective': best.get('objective') if best else None,
+        'top_k': [
+            {
+                'trial_id': row.get('trial_id'),
+                'source': row.get('source'),
+                'objective': row.get('objective'),
+                'median_score': row.get('median_score'),
+                'success_rate_1000': row.get('success_rate_1000'),
+            }
+            for row in top_trials
+        ],
+        'failure_reasons': failure_reasons,
+    }
+
+    print('\n[SUMMARY]')
+    print(f"Trials: {summary['trial_count']}  "
+          f"Success: {summary['success_count']}  Failure: {summary['failure_count']}")
+    print(f"Best trial: {summary['best_trial_id']}  Objective: {summary['best_objective']}")
+    for idx, row in enumerate(summary['top_k'], start=1):
+        print(f"Top {idx}: trial={row['trial_id']}  obj={row['objective']}  "
+              f"median={row['median_score']}  sr={row['success_rate_1000']}")
+    return summary
+
+
+# ============================================================================
+# 15. CLI Entrypoint
+# ============================================================================
+def get_mode_presets(mode):
+    presets = {
+        'debug':    {'max_trial_frames': 100_000, 'eval_interval_frames': 10_000, 'eval_episodes': 3},
+        'normal':   {'max_trial_frames': 1_000_000, 'eval_interval_frames': 20_000, 'eval_episodes': 5},
+        'deep':     {'max_trial_frames': 5_000_000, 'eval_interval_frames': 50_000, 'eval_episodes': 20},
+    }
+    if mode not in presets:
+        raise ValueError(f"Unknown mode: {mode}")
+    return presets[mode]
+
+
+def make_parser():
+    p = argparse.ArgumentParser(description='Flappy Bird DQN Auto-Search System')
+    p.add_argument('--mode', choices=['debug', 'normal', 'deep'], default='normal')
+    p.add_argument('--max-trials', type=int, default=100)
+    p.add_argument('--max-trial-frames', type=int, default=None)
+    p.add_argument('--history', default='search_history.jsonl')
+    p.add_argument('--study-db', default='optuna_study.db')
+    p.add_argument('--n-startup-trials', type=int, default=30)
+    p.add_argument('--baseline-only', action='store_true',
+                   help='Run a single baseline trial and exit (no search)')
+    return p
+
+
+def main():
+    args = make_parser().parse_args()
+    presets = get_mode_presets(args.mode)
+    max_trial_frames = args.max_trial_frames or presets['max_trial_frames']
+
+    print(f"[MODE] {args.mode}  |  max_trial_frames={max_trial_frames}")
+
+    if args.baseline_only:
+        print("[BASELINE-ONLY] Running single baseline trial...")
+        result = run_trial(
+            config=dict(BASELINE_CONFIG), trial_id=-1, seed=11, source='baseline',
+            max_trial_frames=max_trial_frames,
+            eval_interval_frames=presets['eval_interval_frames'],
+            eval_episodes=presets['eval_episodes'],
+        )
+        obj = compute_objective(
+            success=(result['status'] == 'success'),
+            train_raw_env_frames=result['train_raw_env_frames'],
+            max_trial_frames=max_trial_frames,
+            best_eval_score=result['best_eval_score'],
+        )
+        result['objective'] = obj
+        hm = HistoryManager(args.history)
+        hm.append(result)
+        generate_summary(hm)
+        return
+
+    driver = SearchDriver(
+        history_path=args.history, study_db=args.study_db,
+        max_trials=args.max_trials, max_trial_frames=max_trial_frames,
+        eval_interval_frames=presets['eval_interval_frames'],
+        eval_episodes=presets['eval_episodes'],
+        n_startup_trials=args.n_startup_trials,
+    )
+
+    try:
+        driver.run()
+    except KeyboardInterrupt:
+        print("\n[EXIT] Interrupted.")
+        sys.exit(0)
+    except Exception as e:
+        print(f"\n[FATAL] {e}", file=sys.stderr)
+        import traceback; traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

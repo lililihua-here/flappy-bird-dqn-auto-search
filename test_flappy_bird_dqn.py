@@ -533,3 +533,210 @@ def test_compute_objective_failure_clamped_at_1000():
         best_eval_score=1000,
     )
     assert above == at_limit
+
+
+# ============================================================================
+# Task 10: Search Space
+# ============================================================================
+def test_search_space_produces_valid_config():
+    import optuna
+    from flappy_bird_dqn_auto_search import define_search_space
+
+    def objective(trial):
+        config = define_search_space(trial)
+        required = ['lr', 'gamma', 'hidden', 'hidden_key', 'eps_start', 'eps_end',
+                    'eps_decay_decision_steps', 'replay_start_size', 'train_freq']
+        for k in required:
+            assert k in config, f"Missing: {k}"
+        assert 1e-5 <= config['lr'] <= 3e-3
+        assert 0.90 <= config['gamma'] <= 0.999
+        assert config['hidden_key'] in ('small', 'medium', 'large')
+        assert config['hidden'] in ([64, 32], [128, 64], [256, 128])
+        assert 0.01 <= config['eps_start'] <= 0.15
+        assert 0.001 <= config['eps_end'] <= 0.02
+        assert 10000 <= config['eps_decay_decision_steps'] <= 200000
+        assert config['replay_start_size'] in (1000, 5000, 10000)
+        assert config['train_freq'] in (1, 4)
+        assert config['n_step'] == 1
+        return 0.0
+
+    study = optuna.create_study(direction='minimize', sampler=optuna.samplers.RandomSampler(seed=42))
+    study.optimize(objective, n_trials=10)
+    assert len(study.trials) == 10
+
+
+# ============================================================================
+# Task 11: HistoryManager tests
+# ============================================================================
+def test_history_manager_append_and_load_roundtrip():
+    import tempfile
+    from flappy_bird_dqn_auto_search import HistoryManager
+
+    tmp = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.jsonl')
+    tmp.close()
+    try:
+        hm = HistoryManager(tmp.name)
+        hm.append({
+            'trial_id': 0,
+            'status': 'success',
+            'objective': 123.0,
+            'config': {'lr': 1e-4},
+        })
+        rows = hm.load()
+        assert len(rows) == 1
+        assert rows[0]['trial_id'] == 0
+        assert rows[0]['record_type'] == 'trial'
+    finally:
+        os.unlink(tmp.name)
+
+
+def test_history_manager_success_and_failure_counts():
+    import tempfile
+    from flappy_bird_dqn_auto_search import HistoryManager
+
+    tmp = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.jsonl')
+    tmp.close()
+    try:
+        hm = HistoryManager(tmp.name)
+        hm.append({'trial_id': 0, 'status': 'success', 'objective': 100, 'config': {'lr': 1e-4}})
+        hm.append({'trial_id': 1, 'status': 'failure', 'objective': 999999, 'config': {'lr': 2e-4}})
+        hm.append({'record_type': 'recheck', 'trial_id': 0, 'recheck_passed': True})
+        assert hm.success_count() == 1
+        assert hm.failure_count() == 1
+    finally:
+        os.unlink(tmp.name)
+
+
+def test_history_manager_top_k_filters_recheck_and_sorts_by_priority():
+    import tempfile
+    from flappy_bird_dqn_auto_search import HistoryManager
+
+    tmp = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.jsonl')
+    tmp.close()
+    try:
+        hm = HistoryManager(tmp.name)
+        hm.append({
+            'trial_id': 1, 'status': 'success', 'objective': 150000,
+            'config': {'lr': 1e-4}, 'recheck_passed': False,
+            'success_rate_1000': 0.80, 'median_score': 1100,
+            'total_raw_env_frames': 180000,
+        })
+        hm.append({
+            'trial_id': 2, 'status': 'success', 'objective': 140000,
+            'config': {'lr': 2e-4}, 'recheck_passed': True,
+            'success_rate_1000': 0.75, 'median_score': 1050,
+            'total_raw_env_frames': 190000,
+        })
+        hm.append({
+            'trial_id': 3, 'status': 'success', 'objective': 170000,
+            'config': {'lr': 3e-4}, 'recheck_passed': True,
+            'success_rate_1000': 0.90, 'median_score': 1300,
+            'total_raw_env_frames': 200000,
+        })
+        hm.append({'record_type': 'recheck', 'trial_id': 3, 'recheck_passed': True})
+        top = hm.top_k(3)
+        assert [r['trial_id'] for r in top] == [2, 3, 1]
+    finally:
+        os.unlink(tmp.name)
+
+
+# ============================================================================
+# Task 12: Search Driver test
+# ============================================================================
+def test_search_driver_runs_n_trials():
+    import tempfile
+    from flappy_bird_dqn_auto_search import SearchDriver
+
+    tmp = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.jsonl')
+    tmp.close()
+    db_path = tmp.name.replace('.jsonl', '.db')
+
+    try:
+        driver = SearchDriver(
+            history_path=tmp.name, study_db=db_path,
+            max_trials=3, max_trial_frames=3000,
+            eval_interval_frames=1000, eval_episodes=2,
+            candidate_verify_episodes=3,
+            n_startup_trials=2, seed_pool=[42, 43, 44],
+        )
+        driver.run()
+        rows = driver.history.load()
+        assert len(rows) >= 1
+        for r in rows:
+            if r.get('record_type') == 'trial':
+                assert 'trial_id' in r and 'objective' in r and r['objective'] > 0
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except PermissionError:
+            pass
+        if os.path.exists(db_path):
+            try:
+                os.unlink(db_path)
+            except PermissionError:
+                pass
+
+
+# ============================================================================
+# Task 13: Reporting tests
+# ============================================================================
+def test_generate_summary_handles_empty_history():
+    import tempfile
+    from flappy_bird_dqn_auto_search import HistoryManager, generate_summary
+
+    tmp = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.jsonl')
+    tmp.close()
+    try:
+        summary = generate_summary(HistoryManager(tmp.name))
+        assert summary['trial_count'] == 0
+        assert summary['top_k'] == []
+    finally:
+        os.unlink(tmp.name)
+
+
+def test_generate_summary_returns_counts_and_best_trial():
+    import tempfile
+    from flappy_bird_dqn_auto_search import HistoryManager, generate_summary
+
+    tmp = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.jsonl')
+    tmp.close()
+    try:
+        hm = HistoryManager(tmp.name)
+        hm.append({
+            'trial_id': -1, 'source': 'baseline', 'status': 'failure',
+            'objective': 9_999_900, 'config': {'lr': 1e-4},
+            'failure_reason': 'max_frames_reached',
+        })
+        hm.append({
+            'trial_id': 0, 'source': 'tpe', 'status': 'success',
+            'objective': 180000, 'config': {'lr': 2e-4},
+            'median_score': 1050, 'success_rate_1000': 0.75,
+            'total_raw_env_frames': 220000,
+        })
+        summary = generate_summary(hm, top_k=1)
+        assert summary['trial_count'] == 2
+        assert summary['success_count'] == 1
+        assert summary['failure_count'] == 1
+        assert summary['best_trial_id'] == 0
+        assert summary['top_k'][0]['trial_id'] == 0
+        assert summary['failure_reasons']['max_frames_reached'] == 1
+    finally:
+        os.unlink(tmp.name)
+
+
+# ============================================================================
+# Task 14: CLI tests
+# ============================================================================
+def test_mode_presets():
+    from flappy_bird_dqn_auto_search import get_mode_presets
+    debug = get_mode_presets('debug')
+    assert debug['max_trial_frames'] == 100_000
+    assert debug['eval_interval_frames'] == 10_000
+    assert debug['eval_episodes'] == 3
+
+
+def test_parser_defaults():
+    from flappy_bird_dqn_auto_search import make_parser
+    args = make_parser().parse_args([])
+    assert args.mode == 'normal'
+    assert args.max_trials == 100
