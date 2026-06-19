@@ -31,3 +31,15 @@ optuna_study.db
 venv/
 .venv/
 env/
+
+# 文档、计划、Review 报告、参考文献（不上传 GitHub）
+docs/
+review报告/
+参考论文/
+Flappy_Bird_DQN_*.md
+
+# Claude 内部文件
+.claude/
+
+# 模型 checkpoint
+checkpoints/
