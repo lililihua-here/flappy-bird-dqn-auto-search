@@ -95,3 +95,118 @@ def test_is_stable_success_requires_rate_and_median():
         'success_rate_1000': 1.0,
         'median': 1200,
     }) is True
+
+
+# ============================================================================
+# Task 2: Environment tests
+# ============================================================================
+def test_env_reset_returns_valid_state():
+    from flappy_bird_dqn_auto_search import FlappyBirdEnv
+    env = FlappyBirdEnv(seed=42)
+    state = env.reset()
+    required_keys = [
+        'bird_y', 'bird_velocity', 'pipe_x',
+        'pipe_gap_top', 'pipe_gap_bottom', 'pipe_gap_center',
+    ]
+    for k in required_keys:
+        assert k in state, f"Missing key: {k}"
+    assert 0 <= state['bird_y'] <= 800
+    assert state['pipe_x'] > 0
+
+
+def test_env_step_advances_both_counters():
+    from flappy_bird_dqn_auto_search import FlappyBirdEnv
+    env = FlappyBirdEnv(seed=42)
+    env.reset()
+    env.step(0)
+    assert env.total_raw_env_frames == 1
+    assert env.episode_raw_env_frames == 1
+    env.step(0)
+    assert env.total_raw_env_frames == 2
+    assert env.episode_raw_env_frames == 2
+
+
+def test_env_step_returns_tuple():
+    from flappy_bird_dqn_auto_search import FlappyBirdEnv
+    env = FlappyBirdEnv(seed=42)
+    env.reset()
+    result = env.step(0)
+    assert isinstance(result, tuple) and len(result) == 3
+    state, reward, done = result
+    assert isinstance(state, dict)
+    assert isinstance(reward, (int, float))
+    assert isinstance(done, bool)
+
+
+def test_env_pipe_reward_on_pass():
+    from flappy_bird_dqn_auto_search import FlappyBirdEnv
+    env = FlappyBirdEnv(seed=42)
+    env.reset()
+    env.bird_y = env.pipe_gap_center
+    env.bird_velocity = 0.0
+    env._scored_current_pipe = False
+    env.pipe_x = env.BIRD_X - env.PIPE_WIDTH - 1
+    _, reward, _ = env.step(0)
+    assert reward == 1.0, f"Expected pipe_reward=1.0, got {reward}"
+
+
+def test_env_death_reward_on_collision():
+    from flappy_bird_dqn_auto_search import FlappyBirdEnv
+    env = FlappyBirdEnv(seed=42)
+    env.reset()
+    env.bird_y = 5
+    env.bird_velocity = 0.0
+    for _ in range(10):
+        _, reward, done = env.step(0)
+        if done:
+            break
+    assert reward == -1.0
+    assert done is True
+
+
+# ============================================================================
+# Task 3: StateEncoder tests
+# ============================================================================
+def test_state_encoder_output_shape():
+    """encode() returns a 1D array of length state_dim."""
+    from flappy_bird_dqn_auto_search import StateEncoder
+    encoder = StateEncoder()
+    state = {
+        'bird_y': 400.0, 'bird_velocity': 2.0, 'pipe_x': 300.0,
+        'pipe_gap_top': 100.0, 'pipe_gap_bottom': 500.0, 'pipe_gap_center': 300.0,
+    }
+    vec = encoder.encode(state)
+    assert isinstance(vec, np.ndarray)
+    assert vec.dtype == np.float32
+    assert vec.shape == (7,)
+    assert encoder.state_dim == 7
+
+
+def test_state_encoder_normalization_range():
+    """All features should be roughly in [-1, 1] range after normalization."""
+    from flappy_bird_dqn_auto_search import StateEncoder
+    encoder = StateEncoder()
+    test_states = [
+        {'bird_y': 400.0, 'bird_velocity': 0.0, 'pipe_x': 300.0,
+         'pipe_gap_top': 100.0, 'pipe_gap_bottom': 500.0, 'pipe_gap_center': 300.0},
+        {'bird_y': 100.0, 'bird_velocity': -10.0, 'pipe_x': 600.0,
+         'pipe_gap_top': 50.0, 'pipe_gap_bottom': 450.0, 'pipe_gap_center': 250.0},
+        {'bird_y': 700.0, 'bird_velocity': 10.0, 'pipe_x': 50.0,
+         'pipe_gap_top': 300.0, 'pipe_gap_bottom': 700.0, 'pipe_gap_center': 500.0},
+    ]
+    for state in test_states:
+        vec = encoder.encode(state)
+        assert np.all(np.abs(vec) < 2.0), f"Values out of range: {vec}"
+
+
+def test_state_encoder_deterministic():
+    """Same state → same encoding."""
+    from flappy_bird_dqn_auto_search import StateEncoder
+    encoder = StateEncoder()
+    state = {
+        'bird_y': 333.0, 'bird_velocity': -3.0, 'pipe_x': 444.0,
+        'pipe_gap_top': 150.0, 'pipe_gap_bottom': 550.0, 'pipe_gap_center': 350.0,
+    }
+    v1 = encoder.encode(state)
+    v2 = encoder.encode(state)
+    assert np.array_equal(v1, v2)
