@@ -364,7 +364,7 @@ def test_history_manager_top_k_filters_recheck_and_sorts_by_priority():
 
 def test_recheck_top_k_persists_full_summary(monkeypatch):
     import tempfile
-    import flappy_bird_dqn_auto_search as mod
+    import history_reporting
     from flappy_bird_dqn_auto_search import HistoryManager, recheck_top_k
 
     tmp = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.jsonl')
@@ -399,7 +399,7 @@ def test_recheck_top_k_persists_full_summary(monkeypatch):
         def fake_run_trial(**_kwargs):
             return next(fake_results)
 
-        monkeypatch.setattr(mod, 'run_trial', fake_run_trial)
+        monkeypatch.setattr(history_reporting, 'run_trial', fake_run_trial)
         recheck_top_k(hm, k=1, recheck_seeds=(101, 202), max_trial_frames=5000, eval_episodes=5)
 
         rows = hm.load()
