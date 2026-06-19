@@ -1,5 +1,6 @@
 """Contract tests for Flappy Bird DQN Auto-Search System"""
 import numpy as np
+import random
 import sys
 import os
 sys.path.insert(0, os.path.dirname(__file__))
@@ -210,3 +211,176 @@ def test_state_encoder_deterministic():
     v1 = encoder.encode(state)
     v2 = encoder.encode(state)
     assert np.array_equal(v1, v2)
+
+
+# ============================================================================
+# Task 4: ReplayBuffer tests
+# ============================================================================
+def test_replay_buffer_add_and_len():
+    from flappy_bird_dqn_auto_search import ReplayBuffer
+    rb = ReplayBuffer(capacity=3)
+    s = np.zeros(7, dtype=np.float32)
+    rb.add(s, 0, 0.0, s, False)
+    rb.add(s, 1, 1.0, s, True)
+    assert len(rb) == 2
+
+
+def test_replay_buffer_capacity_evicts_oldest():
+    from flappy_bird_dqn_auto_search import ReplayBuffer
+    rb = ReplayBuffer(capacity=2)
+    for i in range(3):
+        s = np.full(7, i, dtype=np.float32)
+        rb.add(s, i % 2, float(i), s, False)
+    assert len(rb) == 2
+    states, actions, rewards, next_states, dones = rb.sample(2)
+    assert 0.0 not in rewards
+
+
+def test_replay_buffer_can_sample():
+    from flappy_bird_dqn_auto_search import ReplayBuffer
+    rb = ReplayBuffer(capacity=10)
+    s = np.zeros(7, dtype=np.float32)
+    for _ in range(3):
+        rb.add(s, 0, 0.0, s, False)
+    assert rb.can_sample(2) is True
+    assert rb.can_sample(4) is False
+
+
+def test_replay_buffer_sample_shapes():
+    from flappy_bird_dqn_auto_search import ReplayBuffer
+    rb = ReplayBuffer(capacity=10)
+    for i in range(5):
+        s = np.full(7, i, dtype=np.float32)
+        ns = np.full(7, i + 1, dtype=np.float32)
+        rb.add(s, i % 2, float(i), ns, i == 4)
+    states, actions, rewards, next_states, dones = rb.sample(4)
+    assert states.shape == (4, 7)
+    assert actions.shape == (4,)
+    assert rewards.shape == (4,)
+    assert next_states.shape == (4, 7)
+    assert dones.shape == (4,)
+
+
+# ============================================================================
+# Task 5: DQN network tests
+# ============================================================================
+def test_dqn_forward_shape():
+    import torch
+    from flappy_bird_dqn_auto_search import DQN
+    net = DQN(state_dim=7, hidden=[64, 32], n_actions=2)
+    x = torch.randn(4, 7)
+    y = net(x)
+    assert tuple(y.shape) == (4, 2)
+
+
+def test_dqn_uses_requested_hidden_layers():
+    import torch.nn as nn
+    from flappy_bird_dqn_auto_search import DQN
+    net = DQN(state_dim=7, hidden=[128, 64], n_actions=2)
+    linears = [m for m in net.net if isinstance(m, nn.Linear)]
+    assert [layer.in_features for layer in linears] == [7, 128, 64]
+    assert [layer.out_features for layer in linears] == [128, 64, 2]
+
+
+# ============================================================================
+# Task 6: DQNAgent tests
+# ============================================================================
+def test_dqn_agent_act_greedy():
+    import torch
+    from flappy_bird_dqn_auto_search import DQNAgent
+    config = {
+        'hidden': [64, 32], 'lr': 1e-4, 'gamma': 0.99, 'batch_sz': 64,
+        'buffer_sz': 1000, 'eps_start': 0.0, 'eps_end': 0.0,
+        'eps_decay_decision_steps': 10000,
+        'replay_start_size': 100, 'train_freq': 1,
+        'target_update_mode': 'soft', 'tau': 0.005,
+        'double_q': True, 'grad_clip_norm': 5,
+        'n_step': 1,
+    }
+    agent = DQNAgent(config, state_dim=7, n_actions=2, device='cpu')
+    state = np.array([0.5, 0.0, 0.8, 0.2, 0.6, 0.0, 0.3], dtype=np.float32)
+    a1 = agent.act(state, training=False)
+    a2 = agent.act(state, training=False)
+    assert a1 == a2
+
+
+def test_dqn_agent_epsilon_decay():
+    import torch
+    from flappy_bird_dqn_auto_search import DQNAgent
+    config = {
+        'hidden': [64, 32], 'lr': 1e-4, 'gamma': 0.99, 'batch_sz': 64,
+        'buffer_sz': 1000, 'eps_start': 0.10, 'eps_end': 0.01,
+        'eps_decay_decision_steps': 1000,
+        'replay_start_size': 100, 'train_freq': 1,
+        'target_update_mode': 'soft', 'tau': 0.005,
+        'double_q': True, 'grad_clip_norm': 5,
+        'n_step': 1,
+    }
+    agent = DQNAgent(config, state_dim=7, n_actions=2, device='cpu')
+    assert abs(agent.epsilon - 0.10) < 1e-6
+    agent.decision_steps = 500
+    agent.decay_epsilon()
+    assert abs(agent.epsilon - 0.055) < 1e-3
+    agent.decision_steps = 1000
+    agent.decay_epsilon()
+    assert abs(agent.epsilon - 0.01) < 1e-6
+
+
+def test_dqn_agent_eps_frames_backward_compat():
+    """P1-5: old 'eps_frames' key still works as fallback."""
+    import torch
+    from flappy_bird_dqn_auto_search import DQNAgent
+    config = {
+        'hidden': [64, 32], 'lr': 1e-4, 'gamma': 0.99, 'batch_sz': 64,
+        'buffer_sz': 1000, 'eps_start': 0.10, 'eps_end': 0.01,
+        'eps_frames': 500,
+        'replay_start_size': 100, 'train_freq': 1,
+        'target_update_mode': 'soft', 'tau': 0.005,
+        'double_q': True, 'grad_clip_norm': 5,
+        'n_step': 1,
+    }
+    agent = DQNAgent(config, state_dim=7, n_actions=2, device='cpu')
+    agent.decision_steps = 500
+    agent.decay_epsilon()
+    assert abs(agent.epsilon - 0.01) < 1e-6
+
+
+def test_dqn_agent_config_assertions():
+    """P1-8: MVP fixed params are asserted on init."""
+    import torch
+    from flappy_bird_dqn_auto_search import DQNAgent
+    import pytest
+    config = {
+        'hidden': [64, 32], 'lr': 1e-4, 'gamma': 0.99, 'batch_sz': 64,
+        'buffer_sz': 1000, 'eps_start': 0.05, 'eps_end': 0.005,
+        'eps_decay_decision_steps': 10000,
+        'replay_start_size': 100, 'train_freq': 1,
+        'target_update_mode': 'soft', 'tau': 0.005,
+        'double_q': True, 'grad_clip_norm': 5,
+        'n_step': 1,
+    }
+    agent = DQNAgent(config, state_dim=7, n_actions=2, device='cpu')
+    bad = dict(config, target_update_mode='hard')
+    with pytest.raises(AssertionError):
+        DQNAgent(bad, state_dim=7, n_actions=2, device='cpu')
+
+
+def test_dqn_agent_train_returns_loss():
+    import torch
+    from flappy_bird_dqn_auto_search import DQNAgent
+    config = {
+        'hidden': [64, 32], 'lr': 1e-3, 'gamma': 0.99, 'batch_sz': 16,
+        'buffer_sz': 1000, 'eps_start': 0.05, 'eps_end': 0.005,
+        'eps_decay_decision_steps': 50000,
+        'replay_start_size': 100, 'train_freq': 1,
+        'target_update_mode': 'soft', 'tau': 0.005,
+        'double_q': True, 'grad_clip_norm': 5,
+        'n_step': 1,
+    }
+    agent = DQNAgent(config, state_dim=7, n_actions=2, device='cpu')
+    for _ in range(200):
+        s = np.random.randn(7).astype(np.float32)
+        ns = np.random.randn(7).astype(np.float32)
+        agent.buffer.add(s, random.randint(0, 1), random.random(), ns, random.random() < 0.1)
+    loss = agent.train()
+    assert isinstance(loss, float) and loss > 0
