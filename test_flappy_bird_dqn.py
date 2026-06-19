@@ -384,3 +384,152 @@ def test_dqn_agent_train_returns_loss():
         agent.buffer.add(s, random.randint(0, 1), random.random(), ns, random.random() < 0.1)
     loss = agent.train()
     assert isinstance(loss, float) and loss > 0
+
+
+# ============================================================================
+# Task 7: Greedy Evaluation + is_stable_success
+# ============================================================================
+def test_greedy_eval_returns_expected_keys_with_independent_env():
+    """P0-2: eval creates its own env and returns correct keys."""
+    import torch
+    from flappy_bird_dqn_auto_search import FlappyBirdEnv, StateEncoder, DQNAgent, greedy_eval
+
+    encoder = StateEncoder()
+    config = {
+        'hidden': [64, 32], 'lr': 1e-4, 'gamma': 0.99, 'batch_sz': 64,
+        'buffer_sz': 1000, 'eps_start': 0.0, 'eps_end': 0.0,
+        'eps_decay_decision_steps': 10000,
+        'replay_start_size': 100, 'train_freq': 1,
+        'target_update_mode': 'soft', 'tau': 0.005,
+        'double_q': True, 'grad_clip_norm': 5, 'n_step': 1,
+    }
+    agent = DQNAgent(config, state_dim=7, n_actions=2, device='cpu')
+    result = greedy_eval(
+        agent=agent, env_factory=FlappyBirdEnv, encoder=encoder,
+        n_episodes=3, eval_seed=42, max_raw_frames_per_ep=120000,
+    )
+    required = ['scores', 'mean', 'median', 'max', 'min', 'success_rate_1000', 'raw_env_frames']
+    for k in required:
+        assert k in result, f"Missing: {k}"
+    assert len(result['scores']) == 3
+
+
+def test_greedy_eval_score_from_env_score():
+    """P1-9: eval scores should come from env.score, not reward inference."""
+    import torch
+    from flappy_bird_dqn_auto_search import FlappyBirdEnv, StateEncoder, DQNAgent, greedy_eval
+
+    encoder = StateEncoder()
+    config = {
+        'hidden': [64, 32], 'lr': 1e-4, 'gamma': 0.99, 'batch_sz': 64,
+        'buffer_sz': 1000, 'eps_start': 0.0, 'eps_end': 0.0,
+        'eps_decay_decision_steps': 10000,
+        'replay_start_size': 100, 'train_freq': 1,
+        'target_update_mode': 'soft', 'tau': 0.005,
+        'double_q': True, 'grad_clip_norm': 5, 'n_step': 1,
+    }
+    agent = DQNAgent(config, state_dim=7, n_actions=2, device='cpu')
+    result = greedy_eval(
+        agent=agent, env_factory=FlappyBirdEnv, encoder=encoder,
+        n_episodes=3, eval_seed=42, max_raw_frames_per_ep=5000,
+    )
+    for s in result['scores']:
+        assert isinstance(s, int) and s >= 0
+
+
+# ============================================================================
+# Task 8: Training Loop tests
+# ============================================================================
+def test_run_trial_baseline_smoke():
+    import torch
+    from flappy_bird_dqn_auto_search import run_trial, BASELINE_CONFIG
+
+    test_config = dict(BASELINE_CONFIG)
+    test_config['replay_start_size'] = 500
+
+    result = run_trial(
+        config=test_config,
+        trial_id=0,
+        seed=42,
+        source='baseline',
+        max_trial_frames=3000,
+        eval_interval_frames=1000,
+        eval_episodes=2,
+        candidate_verify_episodes=3,
+    )
+    required = [
+        'trial_id', 'config', 'seed', 'source', 'status', 'objective',
+        'train_raw_env_frames', 'total_raw_env_frames', 'eval_raw_env_frames',
+        'decision_steps', 'episodes', 'best_train_score',
+        'best_eval_score', 'duration_sec',
+    ]
+    for k in required:
+        assert k in result, f"Missing: {k}"
+    assert result['status'] in ('success', 'failure', 'pruned')
+    assert result['train_raw_env_frames'] > 0
+    assert result['total_raw_env_frames'] == result['train_raw_env_frames'] + result['eval_raw_env_frames']
+
+
+# ============================================================================
+# Task 9: Objective tests
+# ============================================================================
+def test_compute_objective_success_equals_train_frames():
+    from flappy_bird_dqn_auto_search import compute_objective
+    obj = compute_objective(
+        success=True,
+        train_raw_env_frames=123456,
+        max_trial_frames=1_000_000,
+        best_eval_score=1000,
+    )
+    assert obj == 123456
+
+
+def test_compute_objective_failure_is_worse_than_any_success():
+    from flappy_bird_dqn_auto_search import compute_objective
+    failed = compute_objective(
+        success=False,
+        train_raw_env_frames=1_000_000,
+        max_trial_frames=1_000_000,
+        best_eval_score=500,
+    )
+    successful = compute_objective(
+        success=True,
+        train_raw_env_frames=900_000,
+        max_trial_frames=1_000_000,
+        best_eval_score=1000,
+    )
+    assert failed > successful
+
+
+def test_compute_objective_failure_prefers_better_eval_score():
+    from flappy_bird_dqn_auto_search import compute_objective
+    bad = compute_objective(
+        success=False,
+        train_raw_env_frames=1_000_000,
+        max_trial_frames=1_000_000,
+        best_eval_score=0,
+    )
+    good = compute_objective(
+        success=False,
+        train_raw_env_frames=1_000_000,
+        max_trial_frames=1_000_000,
+        best_eval_score=500,
+    )
+    assert bad > good
+
+
+def test_compute_objective_failure_clamped_at_1000():
+    from flappy_bird_dqn_auto_search import compute_objective
+    above = compute_objective(
+        success=False,
+        train_raw_env_frames=1_000_000,
+        max_trial_frames=1_000_000,
+        best_eval_score=1200,
+    )
+    at_limit = compute_objective(
+        success=False,
+        train_raw_env_frames=1_000_000,
+        max_trial_frames=1_000_000,
+        best_eval_score=1000,
+    )
+    assert above == at_limit
