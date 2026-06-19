@@ -144,11 +144,11 @@ class StateEncoder:
         features = [
             bird_y / self.screen_h,                                          # 0: normalized bird y
             bird_vy / self.max_speed,                                         # 1: normalized velocity
-            pipe_x / self.screen_w,                                           # 2: normalized pipe x
+            (pipe_x - FlappyBirdEnv.BIRD_X) / self.screen_w,                  # 2: horizontal dist to pipe
             gap_top / self.screen_h,                                          # 3: normalized gap top
             gap_bot / self.screen_h,                                          # 4: normalized gap bottom
-            (gap_ctr - bird_y) / self.screen_h,                               # 5: vertical dist to gap center
-            (pipe_x - FlappyBirdEnv.BIRD_X) / self.screen_w,                  # 6: horizontal dist to pipe
+            gap_ctr / self.screen_h,                                          # 5: normalized gap center
+            (bird_y - gap_ctr) / self.screen_h,                               # 6: bird to gap-center offset
         ]
         return np.array(features, dtype=np.float32)
 
@@ -352,8 +352,16 @@ def greedy_eval(agent, env_factory, encoder, n_episodes=5,
 # ============================================================================
 def is_stable_success(eval_result, threshold=1000, min_rate=0.70, min_median=1000):
     """Check if eval result meets the stable success criteria (Section 3.3)."""
+    scores = eval_result.get('scores')
+    if scores is not None:
+        scores_arr = np.asarray(scores, dtype=np.float64)
+        success_rate = float(np.mean(scores_arr >= threshold))
+    elif threshold == 1000:
+        success_rate = float(eval_result.get('success_rate_1000', 0.0))
+    else:
+        success_rate = 0.0
     return (
-        eval_result['success_rate_1000'] >= min_rate
+        success_rate >= min_rate
         and eval_result['median'] >= min_median
     )
 
@@ -386,6 +394,28 @@ def set_global_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
+def _build_checkpoint_path(checkpoint_dir, source, trial_id, seed):
+    checkpoint_root = Path(checkpoint_dir)
+    checkpoint_root.mkdir(parents=True, exist_ok=True)
+    filename = f"{source}_trial_{trial_id}_seed_{seed}.pt"
+    return (checkpoint_root / filename).resolve()
+
+
+def _save_agent_checkpoint(agent, config, trial_id, seed, source, checkpoint_dir):
+    checkpoint_path = _build_checkpoint_path(checkpoint_dir, source, trial_id, seed)
+    payload = {
+        'trial_id': trial_id,
+        'seed': seed,
+        'source': source,
+        'config': config,
+        'state_dim': agent.state_dim,
+        'n_actions': agent.n_actions,
+        'q_net_state_dict': agent.q_net.state_dict(),
+    }
+    torch.save(payload, checkpoint_path)
+    return str(checkpoint_path)
+
+
 # ============================================================================
 # 7. Training Loop — P0-1/P0-2/P1-1/P1-9 fixes
 # ============================================================================
@@ -397,7 +427,8 @@ def run_trial(config, trial_id, seed, source='tpe',
               candidate_threshold=1000,
               candidate_min_rate=0.70,
               candidate_min_median=1000,
-              eval_max_frames_per_ep=120_000):
+              eval_max_frames_per_ep=120_000,
+              checkpoint_dir='checkpoints'):
     """Run one trial from scratch. Returns result dict (Section 14.3)."""
     # P0-6 (v1.3): Set global seeds BEFORE any random operations
     set_global_seed(seed)
@@ -570,6 +601,14 @@ def run_trial(config, trial_id, seed, source='tpe',
     total_raw_env_frames = train_raw_env_frames + eval_raw_env_frames
     duration = time.time() - t_start
     code_version = _get_git_hash()
+    checkpoint_path = _save_agent_checkpoint(
+        agent=agent,
+        config=agent.config,
+        trial_id=trial_id,
+        seed=seed,
+        source=source,
+        checkpoint_dir=checkpoint_dir,
+    )
 
     return {
         'trial_id': trial_id,
@@ -600,6 +639,7 @@ def run_trial(config, trial_id, seed, source='tpe',
         'reward_scheme_version': 'mvp_reward_v1',
         'code_version': code_version,
         'implementation_version': 'mvp_v0.2',
+        'checkpoint_path': checkpoint_path,
     }
 
 
@@ -776,11 +816,26 @@ class HistoryManager:
 
     def top_k(self, k=5):
         """P1-3: Sort by Section 16.2 priority rules. Filter trial records only."""
-        rows = [
-            r for r in self.load()
+        all_rows = self.load()
+        trial_rows = [
+            r for r in all_rows
             if r.get('record_type', 'trial') == 'trial'
             and r.get('config')
         ]
+        latest_recheck_by_trial = {}
+        for row in all_rows:
+            if row.get('record_type') == 'recheck' and 'trial_id' in row:
+                latest_recheck_by_trial[row['trial_id']] = row
+
+        rows = []
+        for trial_row in trial_rows:
+            merged = dict(trial_row)
+            recheck_row = latest_recheck_by_trial.get(trial_row.get('trial_id'))
+            if recheck_row:
+                for key, value in recheck_row.items():
+                    if key not in ('record_type', 'trial_id'):
+                        merged[key] = value
+            rows.append(merged)
 
         def ranking_key(r):
             return (
@@ -799,6 +854,127 @@ class HistoryManager:
 # ============================================================================
 # 13. Search Driver — P0-4/P0-5 fixes
 # ============================================================================
+def get_best_render_record(history):
+    """Return the best renderable trial record or raise a clear error."""
+    best = history.best_trial()
+    if best is None:
+        raise ValueError('No trial records found in history.')
+    checkpoint_path = best.get('checkpoint_path')
+    if not checkpoint_path:
+        raise ValueError('Best trial has no checkpoint_path.')
+    checkpoint_file = Path(checkpoint_path)
+    if not checkpoint_file.exists():
+        raise FileNotFoundError(f'Checkpoint file not found: {checkpoint_file}')
+    return best
+
+
+def load_agent_from_checkpoint(checkpoint_path, device=None):
+    """Load an agent and encoder from a saved checkpoint."""
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    config = checkpoint['config']
+    encoder = StateEncoder()
+    agent = DQNAgent(
+        config=config,
+        state_dim=checkpoint.get('state_dim', encoder.state_dim),
+        n_actions=checkpoint.get('n_actions', 2),
+        device=device,
+    )
+    agent.q_net.load_state_dict(checkpoint['q_net_state_dict'])
+    agent.target_net.load_state_dict(checkpoint['q_net_state_dict'])
+    return agent, encoder, checkpoint
+
+
+def _draw_render_frame(screen, font, env, best_record, episode_idx, total_episodes):
+    try:
+        import pygame
+    except ImportError as exc:
+        raise ImportError('pygame is required for render mode.') from exc
+
+    sky = (135, 206, 235)
+    green = (46, 160, 67)
+    yellow = (255, 220, 0)
+    white = (255, 255, 255)
+    black = (20, 20, 20)
+
+    screen.fill(sky)
+
+    pipe_top = int(env.pipe_gap_center - env.PIPE_GAP // 2)
+    pipe_bottom = int(env.pipe_gap_center + env.PIPE_GAP // 2)
+    pipe_x = int(env.pipe_x)
+
+    pygame.draw.rect(screen, green, pygame.Rect(pipe_x, 0, env.PIPE_WIDTH, pipe_top))
+    pygame.draw.rect(
+        screen,
+        green,
+        pygame.Rect(pipe_x, pipe_bottom, env.PIPE_WIDTH, env.SCREEN_HEIGHT - pipe_bottom),
+    )
+    pygame.draw.circle(screen, yellow, (env.BIRD_X, int(env.bird_y)), env.BIRD_SIZE // 2)
+
+    lines = [
+        f"Trial: {best_record.get('trial_id')}  Source: {best_record.get('source')}",
+        f"Episode: {episode_idx}/{total_episodes}  Score: {env.score}",
+        f"Best objective: {best_record.get('objective')}",
+        f"Median: {best_record.get('median_score')}  SR1000: {best_record.get('success_rate_1000')}",
+        "Esc / close window to exit",
+    ]
+    y = 12
+    for line in lines:
+        text = font.render(line, True, black, white)
+        screen.blit(text, (12, y))
+        y += 28
+
+
+def render_best_demo(history_path='search_history.jsonl', episodes=1, fps=60,
+                     max_raw_frames_per_ep=120_000):
+    """Render a greedy demo using the best trial checkpoint from history."""
+    try:
+        import pygame
+    except ImportError as exc:
+        raise ImportError('pygame is required for --render mode. Install it via requirements.txt.') from exc
+
+    history = HistoryManager(history_path)
+    best_record = get_best_render_record(history)
+    agent, encoder, _checkpoint = load_agent_from_checkpoint(best_record['checkpoint_path'])
+    env = FlappyBirdEnv(seed=best_record.get('seed', 0))
+
+    pygame.init()
+    screen = pygame.display.set_mode((env.SCREEN_WIDTH, env.SCREEN_HEIGHT))
+    pygame.display.set_caption('Flappy Bird DQN Render Demo')
+    clock = pygame.time.Clock()
+    font = pygame.font.SysFont(None, 28)
+
+    running = True
+    episode_idx = 0
+    try:
+        while running and episode_idx < episodes:
+            state_dict = env.reset()
+            done = False
+            ep_frames = 0
+            episode_idx += 1
+
+            while running and not done and ep_frames < max_raw_frames_per_ep:
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        running = False
+                    elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                        running = False
+                if not running:
+                    break
+
+                state_vec = encoder.encode(state_dict)
+                action = agent.act(state_vec, training=False)
+                state_dict, _reward, done = env.step(action)
+                ep_frames += 1
+
+                _draw_render_frame(screen, font, env, best_record, episode_idx, episodes)
+                pygame.display.flip()
+                clock.tick(fps)
+    finally:
+        pygame.quit()
+
+
 class SearchDriver:
     """Orchestrates the full hyperparameter search with Optuna TPE."""
 
@@ -806,7 +982,7 @@ class SearchDriver:
                  max_trials=100, max_trial_frames=1_000_000,
                  eval_interval_frames=20_000, eval_episodes=5,
                  candidate_verify_episodes=20, n_startup_trials=30,
-                 seed_pool=(11, 22, 33)):
+                 seed_pool=(11, 22, 33), checkpoint_dir='checkpoints'):
         self.history = HistoryManager(history_path)
         self.study_db = study_db
         self.max_trials = max_trials
@@ -816,6 +992,7 @@ class SearchDriver:
         self.candidate_verify_episodes = candidate_verify_episodes
         self.n_startup_trials = n_startup_trials
         self.seed_pool = list(seed_pool)
+        self.checkpoint_dir = checkpoint_dir
         self._interrupted = False
 
     def _objective(self, trial):
@@ -837,6 +1014,7 @@ class SearchDriver:
             eval_interval_frames=self.eval_interval_frames,
             eval_episodes=self.eval_episodes,
             candidate_verify_episodes=self.candidate_verify_episodes,
+            checkpoint_dir=self.checkpoint_dir,
         )
 
         obj = compute_objective(
@@ -888,6 +1066,7 @@ class SearchDriver:
                 eval_interval_frames=self.eval_interval_frames,
                 eval_episodes=self.eval_episodes,
                 candidate_verify_episodes=self.candidate_verify_episodes,
+                checkpoint_dir=self.checkpoint_dir,
             )
             obj = compute_objective(
                 success=(result['status'] == 'success'),
@@ -1033,9 +1212,7 @@ def recheck_top_k(history, k=5, recheck_seeds=(101, 202, 303),
         recheck_record = {
             'record_type': 'recheck',
             'trial_id': trial.get('trial_id'),
-            'recheck_passed': recheck_summary['recheck_passed'],
-            'recheck_median': recheck_summary['recheck_median'],
-            'recheck_success_rate': recheck_summary['recheck_success_rate'],
+            **recheck_summary,
             'recheck_seeds_used': list(recheck_seeds),
         }
         history.append(recheck_record)
@@ -1064,9 +1241,14 @@ def make_parser():
     p.add_argument('--max-trial-frames', type=int, default=None)
     p.add_argument('--history', default='search_history.jsonl')
     p.add_argument('--study-db', default='optuna_study.db')
+    p.add_argument('--checkpoint-dir', default='checkpoints')
     p.add_argument('--n-startup-trials', type=int, default=30)
     p.add_argument('--baseline-only', action='store_true',
                    help='Run a single baseline trial and exit (no search)')
+    p.add_argument('--render', action='store_true',
+                   help='Render the best checkpoint from history using pygame')
+    p.add_argument('--render-episodes', type=int, default=1)
+    p.add_argument('--render-fps', type=int, default=60)
     return p
 
 
@@ -1077,6 +1259,15 @@ def main():
 
     print(f"[MODE] {args.mode}  |  max_trial_frames={max_trial_frames}")
 
+    if args.render:
+        print(f"[RENDER] Loading best trial from {args.history}")
+        render_best_demo(
+            history_path=args.history,
+            episodes=args.render_episodes,
+            fps=args.render_fps,
+        )
+        return
+
     if args.baseline_only:
         print("[BASELINE-ONLY] Running single baseline trial...")
         result = run_trial(
@@ -1084,6 +1275,7 @@ def main():
             max_trial_frames=max_trial_frames,
             eval_interval_frames=presets['eval_interval_frames'],
             eval_episodes=presets['eval_episodes'],
+            checkpoint_dir=args.checkpoint_dir,
         )
         obj = compute_objective(
             success=(result['status'] == 'success'),
@@ -1103,6 +1295,7 @@ def main():
         eval_interval_frames=presets['eval_interval_frames'],
         eval_episodes=presets['eval_episodes'],
         n_startup_trials=args.n_startup_trials,
+        checkpoint_dir=args.checkpoint_dir,
     )
 
     try:

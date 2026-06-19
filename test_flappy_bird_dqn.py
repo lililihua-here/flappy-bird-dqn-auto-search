@@ -98,6 +98,18 @@ def test_is_stable_success_requires_rate_and_median():
     }) is True
 
 
+def test_is_stable_success_honors_custom_threshold():
+    """Custom threshold must be computed from scores, not hardcoded 1000-rate."""
+    from flappy_bird_dqn_auto_search import is_stable_success
+
+    result = {
+        'scores': [1100] * 20,
+        'success_rate_1000': 1.0,
+        'median': 1100,
+    }
+    assert is_stable_success(result, threshold=1200, min_rate=0.70, min_median=1000) is False
+
+
 # ============================================================================
 # Task 2: Environment tests
 # ============================================================================
@@ -198,6 +210,31 @@ def test_state_encoder_normalization_range():
     for state in test_states:
         vec = encoder.encode(state)
         assert np.all(np.abs(vec) < 2.0), f"Values out of range: {vec}"
+
+
+def test_state_encoder_feature_contract():
+    """Feature positions must match the documented 7-D contract."""
+    from flappy_bird_dqn_auto_search import FlappyBirdEnv, StateEncoder
+    encoder = StateEncoder()
+    state = {
+        'bird_y': 500.0,
+        'bird_velocity': -2.0,
+        'pipe_x': 300.0,
+        'pipe_gap_top': 150.0,
+        'pipe_gap_bottom': 550.0,
+        'pipe_gap_center': 350.0,
+    }
+    vec = encoder.encode(state)
+    expected = np.array([
+        500.0 / FlappyBirdEnv.SCREEN_HEIGHT,
+        -2.0 / FlappyBirdEnv.MAX_FALL_SPEED,
+        (300.0 - FlappyBirdEnv.BIRD_X) / FlappyBirdEnv.SCREEN_WIDTH,
+        150.0 / FlappyBirdEnv.SCREEN_HEIGHT,
+        550.0 / FlappyBirdEnv.SCREEN_HEIGHT,
+        350.0 / FlappyBirdEnv.SCREEN_HEIGHT,
+        (500.0 - 350.0) / FlappyBirdEnv.SCREEN_HEIGHT,
+    ], dtype=np.float32)
+    assert np.allclose(vec, expected)
 
 
 def test_state_encoder_deterministic():
@@ -441,33 +478,36 @@ def test_greedy_eval_score_from_env_score():
 # Task 8: Training Loop tests
 # ============================================================================
 def test_run_trial_baseline_smoke():
-    import torch
+    import tempfile
     from flappy_bird_dqn_auto_search import run_trial, BASELINE_CONFIG
 
     test_config = dict(BASELINE_CONFIG)
     test_config['replay_start_size'] = 500
 
-    result = run_trial(
-        config=test_config,
-        trial_id=0,
-        seed=42,
-        source='baseline',
-        max_trial_frames=3000,
-        eval_interval_frames=1000,
-        eval_episodes=2,
-        candidate_verify_episodes=3,
-    )
-    required = [
-        'trial_id', 'config', 'seed', 'source', 'status', 'objective',
-        'train_raw_env_frames', 'total_raw_env_frames', 'eval_raw_env_frames',
-        'decision_steps', 'episodes', 'best_train_score',
-        'best_eval_score', 'duration_sec',
-    ]
-    for k in required:
-        assert k in result, f"Missing: {k}"
-    assert result['status'] in ('success', 'failure', 'pruned')
-    assert result['train_raw_env_frames'] > 0
-    assert result['total_raw_env_frames'] == result['train_raw_env_frames'] + result['eval_raw_env_frames']
+    with tempfile.TemporaryDirectory() as tmpdir:
+        result = run_trial(
+            config=test_config,
+            trial_id=0,
+            seed=42,
+            source='baseline',
+            max_trial_frames=3000,
+            eval_interval_frames=1000,
+            eval_episodes=2,
+            candidate_verify_episodes=3,
+            checkpoint_dir=tmpdir,
+        )
+        required = [
+            'trial_id', 'config', 'seed', 'source', 'status', 'objective',
+            'train_raw_env_frames', 'total_raw_env_frames', 'eval_raw_env_frames',
+            'decision_steps', 'episodes', 'best_train_score',
+            'best_eval_score', 'duration_sec', 'checkpoint_path',
+        ]
+        for k in required:
+            assert k in result, f"Missing: {k}"
+        assert result['status'] in ('success', 'failure', 'pruned')
+        assert result['train_raw_env_frames'] > 0
+        assert result['total_raw_env_frames'] == result['train_raw_env_frames'] + result['eval_raw_env_frames']
+        assert os.path.exists(result['checkpoint_path'])
 
 
 # ============================================================================
@@ -618,25 +658,86 @@ def test_history_manager_top_k_filters_recheck_and_sorts_by_priority():
         hm = HistoryManager(tmp.name)
         hm.append({
             'trial_id': 1, 'status': 'success', 'objective': 150000,
-            'config': {'lr': 1e-4}, 'recheck_passed': False,
+            'config': {'lr': 1e-4},
             'success_rate_1000': 0.80, 'median_score': 1100,
             'total_raw_env_frames': 180000,
         })
         hm.append({
             'trial_id': 2, 'status': 'success', 'objective': 140000,
-            'config': {'lr': 2e-4}, 'recheck_passed': True,
+            'config': {'lr': 2e-4},
             'success_rate_1000': 0.75, 'median_score': 1050,
             'total_raw_env_frames': 190000,
         })
         hm.append({
             'trial_id': 3, 'status': 'success', 'objective': 170000,
-            'config': {'lr': 3e-4}, 'recheck_passed': True,
+            'config': {'lr': 3e-4},
             'success_rate_1000': 0.90, 'median_score': 1300,
             'total_raw_env_frames': 200000,
         })
-        hm.append({'record_type': 'recheck', 'trial_id': 3, 'recheck_passed': True})
+        hm.append({
+            'record_type': 'recheck', 'trial_id': 2,
+            'recheck_passed': True,
+            'median_train_raw_env_frames_to_stable_1000': 160000,
+        })
+        hm.append({
+            'record_type': 'recheck', 'trial_id': 3,
+            'recheck_passed': True,
+            'median_train_raw_env_frames_to_stable_1000': 170000,
+        })
         top = hm.top_k(3)
         assert [r['trial_id'] for r in top] == [2, 3, 1]
+    finally:
+        os.unlink(tmp.name)
+
+
+def test_recheck_top_k_persists_full_summary(monkeypatch):
+    import tempfile
+    import flappy_bird_dqn_auto_search as mod
+    from flappy_bird_dqn_auto_search import HistoryManager, recheck_top_k
+
+    tmp = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.jsonl')
+    tmp.close()
+    try:
+        hm = HistoryManager(tmp.name)
+        hm.append({
+            'trial_id': 7,
+            'status': 'success',
+            'objective': 123456,
+            'config': {'lr': 1e-4},
+            'success_rate_1000': 0.8,
+            'median_score': 1100,
+            'total_raw_env_frames': 150000,
+        })
+
+        fake_results = iter([
+            {
+                'status': 'success',
+                'train_raw_env_frames': 100000,
+                'median_score': 1200,
+                'success_rate_1000': 0.8,
+            },
+            {
+                'status': 'failure',
+                'train_raw_env_frames': 300000,
+                'median_score': 900,
+                'success_rate_1000': 0.4,
+            },
+        ])
+
+        def fake_run_trial(**_kwargs):
+            return next(fake_results)
+
+        monkeypatch.setattr(mod, 'run_trial', fake_run_trial)
+        recheck_top_k(hm, k=1, recheck_seeds=(101, 202), max_trial_frames=5000, eval_episodes=5)
+
+        rows = hm.load()
+        recheck_rows = [r for r in rows if r.get('record_type') == 'recheck']
+        assert len(recheck_rows) == 1
+        assert recheck_rows[0]['trial_id'] == 7
+        assert 'p10_score' in recheck_rows[0]
+        assert 'p90_score' in recheck_rows[0]
+        assert 'score_std' in recheck_rows[0]
+        assert 'failed_seeds' in recheck_rows[0]
     finally:
         os.unlink(tmp.name)
 
@@ -741,6 +842,74 @@ def test_parser_defaults():
     args = make_parser().parse_args([])
     assert args.mode == 'normal'
     assert args.max_trials == 100
+
+
+def test_parser_render_flags():
+    from flappy_bird_dqn_auto_search import make_parser
+    args = make_parser().parse_args([
+        '--render',
+        '--render-episodes', '2',
+        '--render-fps', '30',
+        '--checkpoint-dir', 'my_ckpts',
+    ])
+    assert args.render is True
+    assert args.render_episodes == 2
+    assert args.render_fps == 30
+    assert args.checkpoint_dir == 'my_ckpts'
+
+
+def test_get_best_render_record_requires_checkpoint_path():
+    import tempfile
+    import pytest
+    from flappy_bird_dqn_auto_search import HistoryManager, get_best_render_record
+
+    tmp = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.jsonl')
+    tmp.close()
+    try:
+        hm = HistoryManager(tmp.name)
+        hm.append({
+            'trial_id': 0,
+            'status': 'success',
+            'objective': 100.0,
+            'config': {'lr': 1e-4},
+        })
+        with pytest.raises(ValueError, match='checkpoint_path'):
+            get_best_render_record(hm)
+    finally:
+        os.unlink(tmp.name)
+
+
+def test_get_best_render_record_returns_best_success_with_checkpoint():
+    import tempfile
+    from flappy_bird_dqn_auto_search import HistoryManager, get_best_render_record
+
+    tmp = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.jsonl')
+    tmp.close()
+    ckpt = tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.pt')
+    ckpt.close()
+    try:
+        hm = HistoryManager(tmp.name)
+        hm.append({
+            'trial_id': -1,
+            'status': 'failure',
+            'source': 'baseline',
+            'objective': 999999.0,
+            'config': {'lr': 1e-4},
+        })
+        hm.append({
+            'trial_id': 2,
+            'status': 'success',
+            'source': 'tpe',
+            'objective': 123.0,
+            'config': {'lr': 2e-4},
+            'checkpoint_path': ckpt.name,
+        })
+        best = get_best_render_record(hm)
+        assert best['trial_id'] == 2
+        assert best['checkpoint_path'] == ckpt.name
+    finally:
+        os.unlink(tmp.name)
+        os.unlink(ckpt.name)
 
 
 # ============================================================================
