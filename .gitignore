@@ -1,14 +1,21 @@
 # Python
 __pycache__/
+.pytest_cache/
 *.py[cod]
 *.so
 *.egg-info/
 dist/
 build/
 
-# Q-table模型文件（训练产出，不需要进版本库）
+# Q-table模型文件（旧版训练产出）
 *.npy
 *.npz
+
+# DQN 搜索系统产物
+search_history.jsonl
+optuna_study.db
+*.db-journal
+*.db-wal
 
 # IDE
 .vscode/
