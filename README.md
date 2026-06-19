@@ -11,6 +11,7 @@
 3. 失败 trial 也返回可比较的惩罚目标值
 4. TPE 利用历史结果指导下一轮参数采样
 5. 支持断点续跑和 Ctrl+C 安全退出
+6. 支持最优模型渲染演示
 
 ## 快速开始
 
@@ -27,8 +28,8 @@ python flappy_bird_dqn_auto_search.py --mode debug --max-trials 10
 # Normal 模式（正式搜索）
 python flappy_bird_dqn_auto_search.py --mode normal --max-trials 100
 
-# Deep 模式（深度搜索）
-python flappy_bird_dqn_auto_search.py --mode deep --max-trials 500
+# 渲染演示搜索到的最佳 agent
+python flappy_bird_dqn_auto_search.py --render --render-episodes 3
 ```
 
 ## 命令行参数
@@ -42,6 +43,10 @@ python flappy_bird_dqn_auto_search.py --mode deep --max-trials 500
 | `--study-db` | optuna_study.db | Optuna SQLite 数据库路径 |
 | `--n-startup-trials` | 30 | TPE 冷启动随机 trial 数 |
 | `--baseline-only` | - | 运行 baseline trial 后退出（不搜索） |
+| `--render` | - | 渲染最佳 agent 的 gameplay 画面 |
+| `--render-episodes` | 1 | 渲染演示局数 |
+| `--render-fps` | 60 | 渲染帧率 |
+| `--checkpoint-dir` | checkpoints | 模型 checkpoint 目录 |
 
 ## 运行测试
 
@@ -70,12 +75,11 @@ pytest test_flappy_bird_dqn.py -v
 
 ## 产物文件
 
-运行后生成：
-
 | 文件 | 说明 |
 |---|---|
 | `search_history.jsonl` | Trial 历史（每行一个 JSON） |
 | `optuna_study.db` | Optuna study 持久化（支持断点续跑） |
+| `checkpoints/` | 成功 trial 的模型权重存档（用于渲染） |
 
 ## 技术栈
 
@@ -85,11 +89,13 @@ Python 3.11 + PyTorch + NumPy + Pygame + Optuna
 
 ```
 flappy-bird-dqn-auto-search/
-├── flappy_bird_dqn_auto_search.py  # 主程序（单文件 MVP）
-├── test_flappy_bird_dqn.py         # 单元测试和集成测试
+├── flappy_bird_dqn_auto_search.py  # 主程序（单文件）
+├── test_flappy_bird_dqn.py         # 单元测试和集成测试（47 个）
 ├── requirements.txt                # Python 依赖
 ├── README.md                       # 本文件
 ├── .gitignore
 ├── docs/                           # 需求文档和实施计划
+├── review报告/                     # Review 报告
+├── 参考论文/                       # 参考文献
 └── flappy_bird_q_optimized.py      # 旧版 Q-Learning（保留参考）
 ```
