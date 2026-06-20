@@ -44,7 +44,7 @@ BASELINE_CONFIG = {
 # ============================================================================
 # Search Space -- Optuna parameter definition (Section 10.6)
 # ============================================================================
-def define_search_space(trial):
+def define_search_space(trial, overrides=None):
     """Define V2 search space with PER and reward ratio parameters.
     Uses scalar categorical choices for Optuna SQLite persistence,
     then maps to actual layer size lists.
@@ -55,7 +55,7 @@ def define_search_space(trial):
         'large': [256, 128],
     }
     hidden_key = trial.suggest_categorical('hidden_key', ['small', 'medium', 'large'])
-    return {
+    config = {
         # Searchable (Section 10.6 — V1 baseline)
         'lr': trial.suggest_float('lr', 1e-5, 3e-3, log=True),
         'gamma': trial.suggest_float('gamma', 0.90, 0.999),
@@ -100,6 +100,11 @@ def define_search_space(trial):
         'reward_scheme_version': trial.suggest_categorical(
             'reward_scheme_version', ['reward_v1_sparse', 'reward_v2_ratio', 'reward_v3_gap_shaping']),
     }
+    if overrides:
+        for key, value in overrides.items():
+            if value is not None:
+                config[key] = value
+    return config
 
 
 class SearchDriver:
@@ -109,7 +114,8 @@ class SearchDriver:
                  max_trials=100, max_trial_frames=1_000_000,
                  eval_interval_frames=20_000, eval_episodes=5,
                  candidate_verify_episodes=20, n_startup_trials=30,
-                 seed_pool=(11, 22, 33), checkpoint_dir='checkpoints'):
+                 seed_pool=(11, 22, 33), checkpoint_dir='checkpoints',
+                 config_overrides=None):
         self.history = HistoryManager(history_path)
         self.study_db = study_db
         self.max_trials = max_trials
@@ -120,11 +126,12 @@ class SearchDriver:
         self.n_startup_trials = n_startup_trials
         self.seed_pool = list(seed_pool)
         self.checkpoint_dir = checkpoint_dir
+        self.config_overrides = dict(config_overrides or {})
         self._interrupted = False
 
     def _objective(self, trial):
         """Optuna objective. P0-5: trial_id = trial.number."""
-        config = define_search_space(trial)
+        config = define_search_space(trial, self.config_overrides)
         trial_id = trial.number
         seed = self.seed_pool[trial_id % len(self.seed_pool)]
 
@@ -187,8 +194,12 @@ class SearchDriver:
 
         if existing == 0 and not has_baseline:
             print(f"\n[STAGE 0] Baseline verification (independent, not counted in max_trials)...")
+            baseline_config = dict(BASELINE_CONFIG)
+            for key, value in self.config_overrides.items():
+                if value is not None:
+                    baseline_config[key] = value
             result = run_trial(
-                config=dict(BASELINE_CONFIG), trial_id=-1, seed=11, source='baseline',
+                config=baseline_config, trial_id=-1, seed=11, source='baseline',
                 max_trial_frames=self.max_trial_frames,
                 eval_interval_frames=self.eval_interval_frames,
                 eval_episodes=self.eval_episodes,

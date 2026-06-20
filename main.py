@@ -2,13 +2,6 @@
 import argparse
 import sys
 from pathlib import Path
-import torch
-from flappy_bird_env import FlappyBirdEnv
-from replay_buffer import StateEncoder
-from dqn_agent import DQNAgent
-from train_eval import run_trial, compute_objective
-from search_driver import SearchDriver, BASELINE_CONFIG, get_mode_presets
-from history_reporting import HistoryManager, generate_summary, generate_all_reports
 
 
 # ============================================================================
@@ -30,6 +23,10 @@ def get_best_render_record(history):
 
 def load_agent_from_checkpoint(checkpoint_path, device=None):
     """Load an agent and encoder from a saved checkpoint."""
+    import torch
+    from replay_buffer import StateEncoder
+    from dqn_agent import DQNAgent
+
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -95,6 +92,8 @@ def render_best_demo(history_path='search_history.jsonl', episodes=1, fps=60,
         import pygame
     except ImportError as exc:
         raise ImportError('pygame is required for --render mode. Install it via requirements.txt.') from exc
+    from flappy_bird_env import FlappyBirdEnv
+    from history_reporting import HistoryManager
 
     history = HistoryManager(history_path)
     best_record = get_best_render_record(history)
@@ -157,21 +156,44 @@ def make_parser():
     p.add_argument('--render-fps', type=int, default=60)
     p.add_argument('--report', action='store_true',
                    help='Generate V2 experiment reports after baseline/search')
-    p.add_argument('--matrix', choices=['baseline', 'structure', 'protocol', 'searcher'],
-                   help='Run experiment matrix')
-    p.add_argument('--final-confirm', type=str,
-                   help='Run 5-seed final confirm for a config JSON file')
-    p.add_argument('--search-strategy', choices=['tpe_fresh', 'warmstart_tpe', 'population_async'],
-                   default='tpe_fresh')
+    p.add_argument('--n-step', type=int, choices=[1, 3, 5], default=None,
+                   help='Override n_step for baseline/search')
+    p.add_argument('--priority', action='store_true',
+                   help='Force-enable prioritized replay (PER)')
+    p.add_argument('--per-alpha', type=float, default=None,
+                   help='Override PER alpha')
+    p.add_argument('--per-beta-start', type=float, default=None,
+                   help='Override PER beta start')
+    p.add_argument('--per-beta-train-updates', type=int, default=None,
+                   help='Override PER beta schedule length in train_updates')
+    p.add_argument('--death-ratio', type=int, default=None,
+                   help='Override death reward ratio')
+    p.add_argument('--alive-ratio', type=float, default=None,
+                   help='Override alive reward ratio')
+    p.add_argument('--reward-scale', type=float, default=None,
+                   help='Override reward scale')
+    p.add_argument('--reward-clip', type=float, default=None,
+                   help='Override reward clip threshold')
     return p
+
+
+def _collect_config_overrides(args):
+    return {
+        'n_step': args.n_step,
+        'priority': True if args.priority else None,
+        'per_alpha': args.per_alpha,
+        'per_beta_start': args.per_beta_start,
+        'per_beta_train_updates': args.per_beta_train_updates,
+        'death_ratio': args.death_ratio,
+        'alive_ratio': args.alive_ratio,
+        'reward_scale': args.reward_scale,
+        'reward_clip': args.reward_clip,
+    }
 
 
 def main():
     args = make_parser().parse_args()
-    presets = get_mode_presets(args.mode)
-    max_trial_frames = args.max_trial_frames or presets['max_trial_frames']
-
-    print(f"[MODE] {args.mode}  |  max_trial_frames={max_trial_frames}")
+    print('[BOOT] Loading runtime...', flush=True)
 
     if args.render:
         print(f"[RENDER] Loading best trial from {args.history}")
@@ -182,10 +204,24 @@ def main():
         )
         return
 
+    from train_eval import run_trial, compute_objective
+    from search_driver import SearchDriver, BASELINE_CONFIG, get_mode_presets
+    from history_reporting import HistoryManager, generate_summary, generate_all_reports
+
+    presets = get_mode_presets(args.mode)
+    max_trial_frames = args.max_trial_frames or presets['max_trial_frames']
+    config_overrides = _collect_config_overrides(args)
+
+    print(f"[MODE] {args.mode}  |  max_trial_frames={max_trial_frames}", flush=True)
+
     if args.baseline_only:
         print("[BASELINE-ONLY] Running single baseline trial...")
+        baseline_config = dict(BASELINE_CONFIG)
+        for key, value in config_overrides.items():
+            if value is not None:
+                baseline_config[key] = value
         result = run_trial(
-            config=dict(BASELINE_CONFIG), trial_id=-1, seed=11, source='baseline',
+            config=baseline_config, trial_id=-1, seed=11, source='baseline',
             max_trial_frames=max_trial_frames,
             eval_interval_frames=presets['eval_interval_frames'],
             eval_episodes=presets['eval_episodes'],
@@ -205,32 +241,6 @@ def main():
             generate_all_reports(hm, args.study_db)
         return
 
-    if args.matrix:
-        from experiment_matrix import (BASELINE_MATRIX, STRUCTURE_ABLATION,
-                                        PROTOCOL_ABLATION, SEARCHER_COMPARISON,
-                                        run_matrix)
-        matrices = {
-            'baseline': BASELINE_MATRIX,
-            'structure': STRUCTURE_ABLATION,
-            'protocol': PROTOCOL_ABLATION,
-            'searcher': SEARCHER_COMPARISON,
-        }
-        results = run_matrix(matrices[args.matrix], mode=args.mode)
-        print(f"[MATRIX] {args.matrix}: {len(results)} results")
-        return
-
-    if args.final_confirm:
-        import json
-        from experiment_matrix import final_confirm
-        with open(args.final_confirm, 'r') as f:
-            config = json.load(f)
-        result = final_confirm(config)
-        status = result['status']
-        print(f"[FINAL-CONFIRM] {status}: "
-              f"sr={result.get('overall_success_rate_1000', 0):.2f} "
-              f"median={result.get('overall_median_score', 0):.0f}")
-        return
-
     driver = SearchDriver(
         history_path=args.history, study_db=args.study_db,
         max_trials=args.max_trials, max_trial_frames=max_trial_frames,
@@ -238,6 +248,7 @@ def main():
         eval_episodes=presets['eval_episodes'],
         n_startup_trials=args.n_startup_trials,
         checkpoint_dir=args.checkpoint_dir,
+        config_overrides=config_overrides,
     )
 
     try:

@@ -1,6 +1,7 @@
 """Training loop, evaluation, early stopping, and objective functions."""
 import math
 import random
+import sys
 import time
 from collections import deque
 
@@ -9,14 +10,58 @@ import torch
 from dqn_agent import DQNAgent
 from flappy_bird_env import FlappyBirdEnv
 from replay_buffer import StateEncoder, ReplayBuffer
-from state_encoder_variants import get_encoder
 from version_utils import get_git_hash, infer_reward_scheme_version
-from lineage import LineageTracker
-from snapshot import (
-    SNAPSHOT_INTERVAL, load_snapshot, verify_snapshot_compatible,
-    restore_snapshot_to_agent, restore_replay_buffer, restore_rng_state,
-    restore_lineage_from_snapshot, capture_snapshot, save_snapshot,
-)
+
+
+def _format_duration(seconds):
+    seconds = max(0, int(seconds))
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours > 0:
+        return f'{hours:02d}:{minutes:02d}:{seconds:02d}'
+    return f'{minutes:02d}:{seconds:02d}'
+
+
+def _format_progress_line(stage, current, total, elapsed_sec, detail=''):
+    stage_label = stage.upper()
+    bar_width = 24
+
+    if total and total > 0:
+        ratio = max(0.0, min(1.0, current / total))
+        filled = int(ratio * bar_width)
+        bar = '#' * filled + '-' * (bar_width - filled)
+        percent_text = f'{ratio * 100:3.0f}%'
+        eta_text = '--:--'
+        if current > 0 and current < total:
+            eta_sec = elapsed_sec * (total - current) / current
+            eta_text = _format_duration(eta_sec)
+    else:
+        bar = '-' * bar_width
+        percent_text = '--%'
+        eta_text = '--:--'
+
+    line = f'[{stage_label:<10}] |{bar}| {percent_text} ETA {eta_text}'
+    if detail:
+        line += f'  {detail}'
+    return line
+
+
+class _ProgressDisplay:
+    def __init__(self):
+        self._last_line = ''
+
+    def update(self, stage, current, total, elapsed_sec, detail=''):
+        line = _format_progress_line(stage, current, total, elapsed_sec, detail)
+        padding = ' ' * max(0, len(self._last_line) - len(line))
+        sys.stdout.write('\r' + line + padding)
+        sys.stdout.flush()
+        self._last_line = line
+
+    def finish(self):
+        if self._last_line:
+            sys.stdout.write('\n')
+            sys.stdout.flush()
+            self._last_line = ''
 
 
 def set_global_seed(seed):
@@ -29,13 +74,16 @@ def set_global_seed(seed):
 
 
 def greedy_eval(agent, env_factory, encoder, n_episodes=5,
-                eval_seed=0, max_raw_frames_per_ep=120000):
+                eval_seed=0, max_raw_frames_per_ep=120000,
+                progress_callback=None, progress_stage='eval'):
     """P0-2: Creates independent env. Returns statistics dict."""
     eval_env = env_factory(seed=eval_seed)
     scores = []
     frames_before = eval_env.total_raw_env_frames
+    stage_t0 = time.time()
+    progress_interval = max(1, n_episodes // 10)
 
-    for _ in range(n_episodes):
+    for idx in range(n_episodes):
         state_dict = eval_env.reset()
         ep_frames = 0
         done = False
@@ -45,6 +93,16 @@ def greedy_eval(agent, env_factory, encoder, n_episodes=5,
             state_dict, _reward, done = eval_env.step(action)
             ep_frames += 1
         scores.append(eval_env.score)
+        if progress_callback is not None and (
+            idx == 0 or (idx + 1) % progress_interval == 0 or idx + 1 == n_episodes
+        ):
+            progress_callback(
+                progress_stage,
+                idx + 1,
+                n_episodes,
+                time.time() - stage_t0,
+                f'episodes={idx + 1}/{n_episodes} score={eval_env.score}',
+            )
 
     total_raw_frames = eval_env.total_raw_env_frames - frames_before
     scores_arr = np.array(scores, dtype=np.float64)
@@ -85,21 +143,8 @@ def run_trial(config, trial_id, seed, source='tpe',
               candidate_min_rate=0.70,
               candidate_min_median=1000,
               eval_max_frames_per_ep=120_000,
-              checkpoint_dir='checkpoints',
-              # V3.1: snapshot + lineage parameters
-              trial_type='fresh',
-              resume_snapshot_path=None,
-              parent_lineage=None,
-              parent_trial_id=None,
-              parent_snapshot_ref=None,
-              snapshot_interval=None,
-              # V3.5: force final eval regardless of candidate verification
-              force_final_eval=False):
-    """Run one trial. Returns result dict (Section 14.3).
-
-    V3.1: When trial_type='fresh' and resume_snapshot_path=None, behavior is
-    identical to V2. resume/warm_start types enable snapshot-driven resume.
-    """
+              checkpoint_dir='checkpoints'):
+    """Run one trial from scratch. Returns result dict (Section 14.3)."""
     # P0-6 (v1.3): Set global seeds BEFORE any random operations
     set_global_seed(seed)
 
@@ -114,8 +159,9 @@ def run_trial(config, trial_id, seed, source='tpe',
         'reward_clip': config.get('reward_clip', None),
     }
     env = FlappyBirdEnv(seed=seed, reward_config=reward_config)
-    state_encoder_version = config.get("state_representation_version", "low_dim_v1")
-    encoder = get_encoder(state_encoder_version)
+    encoder = StateEncoder()
+    progress_interval = max(1000, min(10000, eval_interval_frames // 2))
+    progress = _ProgressDisplay()
 
     agent = DQNAgent(
         config={
@@ -178,67 +224,35 @@ def run_trial(config, trial_id, seed, source='tpe',
     if buffer is not None:
         agent.buffer = buffer
 
-    # ---- V3.1: Lineage tracker initialization ----
-    if trial_type == "fresh":
-        lineage = LineageTracker(trial_type=trial_type, trial_id=trial_id)
-    else:
-        lineage = None  # created in resume path below
-
-    # ---- V3.1: Strict validation of trial_type + resume_snapshot_path pairing ----
-    if resume_snapshot_path is not None and trial_type == "fresh":
-        raise ValueError(
-            "resume_snapshot_path requires trial_type='resume' or 'warm_start', not 'fresh'"
+    # Warmup (Section 8.2)
+    warmup_target = config.get('replay_start_size', 5000)
+    warmup_interval = max(1, warmup_target // 20)
+    warmup_t0 = time.time()
+    state_dict = env.reset()
+    for idx in range(warmup_target):
+        action = random.randint(0, 1)
+        next_dict, reward, done = env.step(action)
+        agent.buffer.add(
+            encoder.encode(state_dict), action, reward,
+            encoder.encode(next_dict), done,
         )
-    if resume_snapshot_path is None and trial_type != "fresh":
-        raise ValueError(
-            f"trial_type='{trial_type}' requires resume_snapshot_path, but none was provided"
-        )
-
-    # ---- V3.1: Default snapshot_interval ----
-    if snapshot_interval is None:
-        snapshot_interval = SNAPSHOT_INTERVAL
-
-    # ---- V3.1: Resume path — restore from snapshot, skip warmup ----
-    if resume_snapshot_path is not None:
-        snapshot = load_snapshot(resume_snapshot_path)
-        if not verify_snapshot_compatible(snapshot, config):
-            raise ValueError("Snapshot incompatible with current config")
-        restore_snapshot_to_agent(snapshot, agent)
-        agent.buffer = restore_replay_buffer(snapshot, config)
-        restore_rng_state(snapshot)
-        if trial_type == "resume":
-            lineage = restore_lineage_from_snapshot(snapshot)
-        elif trial_type in ("warm_start", "population_inherited"):
-            parent_lineage = restore_lineage_from_snapshot(snapshot)
-            lineage = LineageTracker(
-                trial_type=trial_type, trial_id=trial_id,
-                parent_lineage=parent_lineage,
-                parent_trial_id=snapshot.trial_id,
-                parent_snapshot_ref=str(resume_snapshot_path),
+        if done:
+            state_dict = env.reset()
+        else:
+            state_dict = next_dict
+        if idx == 0 or (idx + 1) % warmup_interval == 0 or idx + 1 == warmup_target:
+            progress.update(
+                'warmup',
+                idx + 1,
+                warmup_target,
+                time.time() - warmup_t0,
+                f'frames={idx + 1}/{warmup_target}',
             )
-        resume_base_frames = lineage.local_train_raw_env_frames
-        env_frames_at_training_start = env.total_raw_env_frames
-        state_dict = env.reset()
-        train_raw_env_frames = env.total_raw_env_frames
-    else:
-        resume_base_frames = 0
-
-        # Warmup (Section 8.2) — V2 behaviour, unchanged
-        state_dict = env.reset()
-        for _ in range(config.get('replay_start_size', 5000)):
-            action = random.randint(0, 1)
-            next_dict, reward, done = env.step(action)
-            agent.buffer.add(
-                encoder.encode(state_dict), action, reward,
-                encoder.encode(next_dict), done,
-            )
-            if done:
-                state_dict = env.reset()
-            else:
-                state_dict = next_dict
-        lineage.add_frames(env.total_raw_env_frames)
-        train_raw_env_frames = env.total_raw_env_frames
-        env_frames_at_training_start = env.total_raw_env_frames
+    train_raw_env_frames = env.total_raw_env_frames
+    next_progress_frame = (
+        ((train_raw_env_frames // progress_interval) + 1) * progress_interval
+    )
+    train_t0 = time.time()
 
     # Training loop
     best_train_score = 0
@@ -253,16 +267,11 @@ def run_trial(config, trial_id, seed, source='tpe',
     status = 'failure'
     failure_reason = 'max_frames_reached'
     eval_call_count = 0
-    last_snapshot_path = ''
-
-    # V3.1: cumulative frames = resume_base + env-local frames
-    train_raw_env_frames = resume_base_frames + env.total_raw_env_frames
 
     while train_raw_env_frames < max_trial_frames:
         state_vec = encoder.encode(state_dict)
         action = agent.act(state_vec, training=True)
         next_dict, reward, done = env.step(action)
-        lineage.add_frames(1)
 
         agent.buffer.add(state_vec, action, reward, encoder.encode(next_dict), done)
 
@@ -270,7 +279,6 @@ def run_trial(config, trial_id, seed, source='tpe',
             loss = agent.train()
             if loss is not None:
                 recent_losses.append(loss)
-                lineage.add_update()
 
         agent.decay_epsilon()
 
@@ -284,7 +292,22 @@ def run_trial(config, trial_id, seed, source='tpe',
             state_dict = next_dict
 
         # P0-1: eval uses independent env, training env total IS train-only
-        train_raw_env_frames = resume_base_frames + env.total_raw_env_frames
+        train_raw_env_frames = env.total_raw_env_frames
+
+        if train_raw_env_frames >= next_progress_frame:
+            progress.update(
+                'train',
+                train_raw_env_frames,
+                max_trial_frames,
+                time.time() - train_t0,
+                (
+                    f'frames={train_raw_env_frames}/{max_trial_frames} '
+                    f'episodes={total_episodes} '
+                    f'best_train={best_train_score} '
+                    f'best_eval={best_eval_median:.0f}'
+                ),
+            )
+            next_progress_frame += progress_interval
 
         # Periodic eval (Section 8.3)
         if train_raw_env_frames > 0 and train_raw_env_frames % eval_interval_frames == 0:
@@ -294,8 +317,21 @@ def run_trial(config, trial_id, seed, source='tpe',
                 agent=agent, env_factory=FlappyBirdEnv, encoder=encoder,
                 n_episodes=eval_episodes, eval_seed=eval_seed,
                 max_raw_frames_per_ep=eval_max_frames_per_ep,
+                progress_callback=progress.update,
+                progress_stage='eval',
             )
             eval_raw_env_frames += eval_result['raw_env_frames']
+            progress.update(
+                'eval',
+                eval_episodes,
+                eval_episodes,
+                0.0,
+                (
+                    f'median={eval_result["median"]:.0f} '
+                    f'max={eval_result["max"]} '
+                    f'sr={eval_result["success_rate_1000"]:.0%}'
+                ),
+            )
 
             if eval_result['median'] > best_eval_median:
                 best_eval_median = eval_result['median']
@@ -316,8 +352,21 @@ def run_trial(config, trial_id, seed, source='tpe',
                     agent=agent, env_factory=FlappyBirdEnv, encoder=encoder,
                     n_episodes=candidate_verify_episodes, eval_seed=verify_seed,
                     max_raw_frames_per_ep=eval_max_frames_per_ep,
+                    progress_callback=progress.update,
+                    progress_stage='verify',
                 )
                 eval_raw_env_frames += verify_result['raw_env_frames']
+                progress.update(
+                    'verify',
+                    candidate_verify_episodes,
+                    candidate_verify_episodes,
+                    0.0,
+                    (
+                        f'median={verify_result["median"]:.0f} '
+                        f'max={verify_result["max"]} '
+                        f'sr={verify_result["success_rate_1000"]:.0%}'
+                    ),
+                )
 
                 if is_stable_success(verify_result, candidate_threshold,
                                      candidate_min_rate, candidate_min_median):
@@ -340,19 +389,13 @@ def run_trial(config, trial_id, seed, source='tpe',
                 failure_reason = stop_reason
                 break
 
-        # V3.1: Periodic snapshot saving (after eval logic, before next iteration)
-        if train_raw_env_frames > 0 and train_raw_env_frames % snapshot_interval == 0:
-            s = capture_snapshot(agent, env, config, trial_id, seed, source, lineage)
-            path, sha = save_snapshot(s, checkpoint_dir)
-            last_snapshot_path = path
-
-
+    # Build result
     final_eval_scores = None
     final_median = 0.0
     final_mean = 0.0
     final_success_rate = 0.0
 
-    if candidate_result is not None and not force_final_eval:
+    if candidate_result is not None:
         final_eval_scores = candidate_result['scores']
         final_median = candidate_result['median']
         final_mean = candidate_result['mean']
@@ -364,8 +407,21 @@ def run_trial(config, trial_id, seed, source='tpe',
             agent=agent, env_factory=FlappyBirdEnv, encoder=encoder,
             n_episodes=20, eval_seed=final_eval_seed,
             max_raw_frames_per_ep=eval_max_frames_per_ep,
+            progress_callback=progress.update,
+            progress_stage='final-eval',
         )
         eval_raw_env_frames += final_eval['raw_env_frames']
+        progress.update(
+            'final-eval',
+            20,
+            20,
+            0.0,
+            (
+                f'median={final_eval["median"]:.0f} '
+                f'max={final_eval["max"]} '
+                f'sr={final_eval["success_rate_1000"]:.0%}'
+            ),
+        )
         final_eval_scores = final_eval['scores']
         final_median = final_eval['median']
         final_mean = final_eval['mean']
@@ -389,9 +445,7 @@ def run_trial(config, trial_id, seed, source='tpe',
         target_net=agent.target_net,
         config={
             **agent.config,
-            'reward_scheme_version': config.get('reward_scheme_version',
-                                                infer_reward_scheme_version(config)),
-            'state_representation_version': state_encoder_version,
+            'reward_scheme_version': infer_reward_scheme_version(config),
         },
         trial_id=trial_id,
         seed=seed,
@@ -400,12 +454,12 @@ def run_trial(config, trial_id, seed, source='tpe',
         decision_steps=agent.decision_steps,
         state_dim=agent.state_dim,
         n_actions=agent.n_actions,
-        state_representation_version=state_encoder_version,
     )
     checkpoint_prefix = f'{source}_trial_{trial_id}_seed_{seed}'
     checkpoint_path, checkpoint_sha256 = save_checkpoint(
         payload, checkpoint_dir, prefix=checkpoint_prefix
     )
+    progress.finish()
 
     return {
         'trial_id': trial_id,
@@ -434,9 +488,8 @@ def run_trial(config, trial_id, seed, source='tpe',
         'duration_sec': duration,
         'init_strategy': 'random_init',
         'environment_version': 'fixed_env_v1',
-        'state_representation_version': state_encoder_version,
-        'reward_scheme_version': config.get('reward_scheme_version',
-                                            infer_reward_scheme_version(config)),
+        'state_representation_version': 'low_dim_v1',
+        'reward_scheme_version': infer_reward_scheme_version(config),
         'code_version': code_version,
         'checkpoint_path': checkpoint_path,
         'checkpoint_sha256': checkpoint_sha256,
@@ -450,25 +503,6 @@ def run_trial(config, trial_id, seed, source='tpe',
         'per_beta_start': config.get('per_beta_start'),
         'per_beta_train_updates': config.get('per_beta_train_updates'),
         'per_priority_eps': config.get('per_priority_eps'),
-        # V3.1: Lineage and snapshot fields
-        'trial_type': lineage.trial_type,
-        'lineage_chain_id': lineage.lineage_chain_id,
-        'lineage_node_id': lineage.lineage_node_id,
-        'lineage_root_trial_id': lineage.lineage_root_trial_id,
-        'parent_trial_id': lineage.parent_trial_id,
-        'parent_snapshot_ref': lineage.parent_snapshot_ref,
-        'inheritance_depth': lineage.inheritance_depth,
-        'local_train_raw_env_frames': lineage.local_train_raw_env_frames,
-        'lineage_train_raw_env_frames': lineage.lineage_train_raw_env_frames,
-        'train_updates': lineage.train_updates,
-        'last_snapshot_path': last_snapshot_path,
-        'block_raw_env_frames': env.total_raw_env_frames,
-        'replay_buffer_size': len(agent.buffer) if hasattr(agent.buffer, '__len__') else 0,
-        'n_step_queue_length': (
-            len(agent.buffer._n_step_queue)
-            if hasattr(agent.buffer, '_n_step_queue') else 0
-        ),
-        'epsilon': agent.epsilon,
     }
 
 

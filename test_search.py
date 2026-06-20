@@ -1,5 +1,6 @@
 """Contract tests for search_driver module."""
 import os
+import subprocess
 import sys
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -44,6 +45,70 @@ def test_search_space_produces_valid_config():
     study = optuna.create_study(direction='minimize', sampler=optuna.samplers.RandomSampler(seed=42))
     study.optimize(objective, n_trials=10)
     assert len(study.trials) == 10
+
+
+def test_search_space_applies_cli_overrides():
+    from search_driver import define_search_space
+
+    class DummyTrial:
+        def suggest_float(self, name, *args, **kwargs):
+            if name == 'lr':
+                return 1e-4
+            if name == 'gamma':
+                return 0.99
+            if name == 'eps_start':
+                return 0.05
+            if name == 'eps_end':
+                return 0.005
+            if name == 'per_alpha':
+                return 0.5
+            if name == 'per_beta_start':
+                return 0.35
+            if name == 'alive_ratio':
+                return 0.001
+            raise AssertionError(f'unexpected float param: {name}')
+
+        def suggest_int(self, name, *args, **kwargs):
+            if name == 'eps_decay_decision_steps':
+                return 50000
+            if name == 'per_beta_train_updates':
+                return 200000
+            if name == 'death_ratio':
+                return 20
+            raise AssertionError(f'unexpected int param: {name}')
+
+        def suggest_categorical(self, name, choices):
+            mapping = {
+                'hidden_key': 'medium',
+                'replay_start_size': 5000,
+                'train_freq': 1,
+                'n_step': 1,
+                'priority': False,
+                'reward_scale': 1.0,
+                'reward_clip': None,
+            }
+            if name not in mapping:
+                raise AssertionError(f'unexpected categorical param: {name}')
+            return mapping[name]
+
+    config = define_search_space(
+        DummyTrial(),
+        overrides={
+            'n_step': 3,
+            'priority': True,
+            'per_alpha': 0.6,
+            'per_beta_start': 0.4,
+            'reward_scale': 0.1,
+            'reward_clip': 10,
+        },
+    )
+
+    assert config['n_step'] == 3
+    assert config['priority'] is True
+    assert config['per_alpha'] == 0.6
+    assert config['per_beta_start'] == 0.4
+    assert config['reward_scale'] == 0.1
+    assert config['reward_clip'] == 10
 
 
 # ============================================================================
@@ -98,23 +163,58 @@ def test_mode_presets():
 # Parser tests (make_parser still lives in flappy_bird_dqn_auto_search)
 # ============================================================================
 def test_parser_defaults():
-    from flappy_bird_dqn_auto_search import make_parser
+    from main import make_parser
     args = make_parser().parse_args([])
     assert args.mode == 'normal'
     assert args.max_trials == 100
 
 
 def test_parser_render_flags():
-    from flappy_bird_dqn_auto_search import make_parser
+    from main import make_parser
     args = make_parser().parse_args([
         '--render',
         '--render-episodes', '2',
         '--render-fps', '30',
         '--checkpoint-dir', 'my_ckpts',
         '--report',
+        '--n-step', '3',
+        '--priority',
+        '--per-alpha', '0.6',
+        '--per-beta-start', '0.4',
+        '--per-beta-train-updates', '12345',
+        '--death-ratio', '10',
+        '--alive-ratio', '0.001',
+        '--reward-scale', '0.1',
+        '--reward-clip', '10',
     ])
     assert args.render is True
     assert args.render_episodes == 2
     assert args.render_fps == 30
     assert args.checkpoint_dir == 'my_ckpts'
     assert args.report is True
+    assert args.n_step == 3
+    assert args.priority is True
+    assert args.per_alpha == 0.6
+    assert args.per_beta_start == 0.4
+    assert args.per_beta_train_updates == 12345
+    assert args.death_ratio == 10
+    assert args.alive_ratio == 0.001
+    assert args.reward_scale == 0.1
+    assert args.reward_clip == 10.0
+
+
+def test_import_main_is_lightweight():
+    script = (
+        'import sys; '
+        'import main; '
+        'print("torch" in sys.modules); '
+        'print("optuna" in sys.modules)'
+    )
+    proc = subprocess.run(
+        [sys.executable, '-c', script],
+        cwd=os.path.dirname(__file__),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert proc.stdout.splitlines() == ['False', 'False']

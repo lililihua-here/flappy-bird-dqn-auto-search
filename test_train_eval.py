@@ -55,6 +55,39 @@ def test_run_trial_baseline_smoke():
         assert result['state_representation_version'] == 'low_dim_v1'
 
 
+def test_format_progress_line_contains_stage_percent_and_eta():
+    from train_eval import _format_progress_line
+
+    line = _format_progress_line(
+        stage='warmup',
+        current=50,
+        total=100,
+        elapsed_sec=10.0,
+        detail='frames=50/100',
+    )
+
+    assert 'WARMUP' in line
+    assert '50%' in line
+    assert 'ETA' in line
+    assert 'frames=50/100' in line
+
+
+def test_format_progress_line_handles_unknown_total():
+    from train_eval import _format_progress_line
+
+    line = _format_progress_line(
+        stage='eval',
+        current=2,
+        total=0,
+        elapsed_sec=3.0,
+        detail='episodes=2',
+    )
+
+    assert 'EVAL' in line
+    assert '--%' in line
+    assert 'ETA --:--' in line
+
+
 # ============================================================================
 # greedy_eval tests
 # ============================================================================
