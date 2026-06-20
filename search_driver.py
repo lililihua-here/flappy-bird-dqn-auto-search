@@ -220,6 +220,47 @@ class SearchDriver:
 
         generate_summary(self.history)
 
+    def run_population_async(self, total_frame_budget=None, population_size=4,
+                              eval_interval=20_000, exploit_interval=50_000):
+        """Run population-based asynchronous self-evolution search.
+
+        Warm-starts workers from top K history configs, then runs the
+        PopulationController exploit/explore loop for the given frame budget.
+        """
+        from population import PopulationController
+
+        if total_frame_budget is None:
+            total_frame_budget = self.max_trial_frames * 5
+
+        pc = PopulationController(
+            population_size=population_size,
+            history=self.history,
+            eval_interval=eval_interval,
+            exploit_interval=exploit_interval,
+        )
+
+        # Warm-start: seed workers from top K history configs
+        top_configs = self.history.top_k(population_size)
+        for i, row in enumerate(top_configs):
+            config = dict(row.get('config', {}))
+            if not config:
+                continue
+            seed = self.seed_pool[i % len(self.seed_pool)]
+            trial_id = pc._next_trial_id()
+            pc.add_worker(trial_id, config, seed)
+
+        # Fill remaining slots with fresh baseline-config workers
+        while len(pc.workers) < population_size:
+            config = dict(BASELINE_CONFIG)
+            seed = self.seed_pool[len(pc.workers) % len(self.seed_pool)]
+            trial_id = pc._next_trial_id()
+            pc.add_worker(trial_id, config, seed)
+
+        print(f"\n[POPULATION] {len(pc.workers)} workers, "
+              f"budget={total_frame_budget:,} frames")
+        pc.run(total_frame_budget)
+        generate_summary(self.history)
+
     def _sigint_handler(self, signum, frame):
         """P0-4: Set flag only. Let current trial finish, then stop."""
         print("\n[Ctrl+C] Will stop after current trial completes. Press again to force-quit.")
