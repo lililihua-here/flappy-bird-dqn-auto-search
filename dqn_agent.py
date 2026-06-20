@@ -3,6 +3,7 @@ import random
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from replay_buffer import ReplayBuffer
 
 
@@ -43,12 +44,6 @@ class DQNAgent:
             "MVP fixed: torch_optimizer must be 'Adam'"
         assert config.get('loss_type', 'Huber') == 'Huber', \
             "MVP fixed: loss_type must be 'Huber'"
-        assert config.get('reward_pipe', 1.0) == 1.0, \
-            "MVP fixed: reward_pipe must be 1.0 (env hardcoded)"
-        assert config.get('reward_death', -1.0) == -1.0, \
-            "MVP fixed: reward_death must be -1.0 (env hardcoded)"
-        assert config.get('reward_alive', 0.0) == 0.0, \
-            "MVP fixed: reward_alive must be 0.0 (env hardcoded)"
 
         self.config = config
         self.state_dim = state_dim
@@ -81,12 +76,24 @@ class DQNAgent:
 
         sample = self.buffer.sample(self.config['batch_sz'])
 
-        # Handle both standard (5-tuple) and n-step (7-tuple) buffers
         gamma_powers_t = None
+        is_weights = None
+        per_indices = None
 
-        if len(sample) == 7:
-            states, actions, rewards, next_states, dones, gamma_powers_arr, _actual_ns = sample
+        if len(sample) == 9:
+            # NStepPERBuffer
+            states, actions, rewards, next_states, dones, gamma_powers_arr, actual_ns, weights_arr, per_indices = sample
             gamma_powers_t = torch.from_numpy(gamma_powers_arr).unsqueeze(1).to(self.device)
+            is_weights = torch.from_numpy(weights_arr).to(self.device)
+        elif len(sample) == 7:
+            states, actions, rewards, next_states, dones, extra1, extra2 = sample
+            if extra1.ndim == 2 and extra1.shape[1] == 1:
+                # PERBuffer: weights (B,1), indices
+                is_weights = torch.from_numpy(extra1).to(self.device)
+                per_indices = extra2
+            else:
+                # NStepReplayBuffer: gamma_powers (B,), actual_ns
+                gamma_powers_t = torch.from_numpy(extra1).unsqueeze(1).to(self.device)
         elif len(sample) == 5:
             states, actions, rewards, next_states, dones = sample
         else:
@@ -106,11 +113,15 @@ class DQNAgent:
                 next_q = self.target_net(next_states_t).gather(1, next_actions)
             else:
                 next_q = self.target_net(next_states_t).max(1, keepdim=True)[0]
-            # Per-sample discount: gamma^n for n-step, fixed gamma for 1-step
             discount = gamma_powers_t if gamma_powers_t is not None else self.config['gamma']
             target = rewards_t + (1.0 - dones_t) * discount * next_q
 
-        loss = self.loss_fn(q_values, target)
+        td_loss = F.smooth_l1_loss(q_values, target, reduction='none')
+        if is_weights is not None:
+            loss = (is_weights * td_loss).mean()
+        else:
+            loss = td_loss.mean()
+
         self.optimizer.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(self.q_net.parameters(), self.config['grad_clip_norm'])
@@ -120,6 +131,11 @@ class DQNAgent:
         tau = self.config['tau']
         for tp, p in zip(self.target_net.parameters(), self.q_net.parameters()):
             tp.data.copy_(tau * p.data + (1.0 - tau) * tp.data)
+
+        if per_indices is not None and hasattr(self.buffer, 'update_priorities'):
+            with torch.no_grad():
+                td_errors = (q_values.detach() - target.detach()).abs().cpu().numpy().reshape(-1)
+            self.buffer.update_priorities(per_indices, td_errors)
 
         return float(loss.item())
 

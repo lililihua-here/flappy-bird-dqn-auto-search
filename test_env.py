@@ -89,3 +89,42 @@ def test_env_death_reward_on_collision():
             break
     assert reward == -1.0
     assert done is True
+
+
+# ============================================================================
+# Stage D: Configurable reward tests
+# ============================================================================
+def test_env_configurable_death_reward():
+    from flappy_bird_env import FlappyBirdEnv
+    env = FlappyBirdEnv(seed=42, reward_config={'death_ratio': 10, 'reward_scale': 1.0})
+    env.reset()
+    env.bird_y = 5
+    for _ in range(10):
+        _, reward, done = env.step(0)
+        if done:
+            break
+    assert reward == -10.0
+
+
+def test_env_reward_scale_applied():
+    from flappy_bird_env import FlappyBirdEnv
+    env = FlappyBirdEnv(seed=42, reward_config={'death_ratio': 1, 'reward_scale': 0.1})
+    env.reset()
+    env.bird_y = 5
+    for _ in range(10):
+        _, reward, done = env.step(0)
+        if done:
+            break
+    assert reward == -0.1
+
+
+def test_env_default_reward_config_matches_v1():
+    """Ensure default reward_config produces V1-compatible rewards."""
+    from flappy_bird_env import FlappyBirdEnv
+    env = FlappyBirdEnv(seed=42)
+    env.reset()
+    assert env.reward_config['death_ratio'] == 1
+    assert env.reward_config['reward_scale'] == 1.0
+    assert env.reward_config['pipe_reward'] == 1.0
+    assert env.reward_config['alive_ratio'] == 0.0
+    assert env.reward_config['reward_clip'] is None

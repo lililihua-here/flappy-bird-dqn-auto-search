@@ -4,7 +4,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(__file__))
 
-from replay_buffer import StateEncoder, ReplayBuffer, NStepReplayBuffer
+from replay_buffer import StateEncoder, ReplayBuffer, NStepReplayBuffer, SumTree, PERBuffer, NStepPERBuffer
 
 
 # ============================================================================
@@ -162,3 +162,97 @@ def test_nstep_buffer_sample_shapes():
     assert n_returns.shape == (16,)
     assert gamma_powers.shape == (16,)
     assert actual_ns.shape == (16,)
+
+
+# ============================================================================
+# SumTree tests (Stage C)
+# ============================================================================
+def test_sum_tree_basic():
+    tree = SumTree(capacity=16)
+    tree.add(5.0, ('a',))
+    tree.add(3.0, ('b',))
+    assert abs(tree.total() - 8.0) < 1e-6
+
+
+def test_sum_tree_get_and_update():
+    tree = SumTree(capacity=8)
+    tree.add(10.0, ('x',))
+    tree.add(5.0, ('y',))
+    tree.add(1.0, ('z',))
+    total = tree.total()
+    assert abs(total - 16.0) < 1e-6
+    # Should be able to retrieve items proportionally
+    idx, priority, data = tree.get(0.0)
+    assert data == ('x',)
+    idx, priority, data = tree.get(15.5)
+    assert data == ('z',)
+
+
+# ============================================================================
+# PERBuffer tests (Stage C)
+# ============================================================================
+def test_per_buffer_samples_with_weights():
+    buf = PERBuffer(capacity=100, alpha=0.6, beta=0.4, beta_train_updates=1000)
+    s = np.zeros(7, dtype=np.float32)
+    for _ in range(50):
+        buf.add(s, 0, 0.5, s, False)
+    states, actions, rewards, next_states, dones, weights, indices = buf.sample(32)
+    assert weights.shape == (32, 1)
+    assert indices.shape == (32,)
+
+
+def test_per_buffer_update_priorities():
+    buf = PERBuffer(capacity=100, alpha=0.6, beta=0.4, beta_train_updates=1000)
+    s = np.zeros(7, dtype=np.float32)
+    for _ in range(50):
+        buf.add(s, 0, 0.5, s, False)
+    sample = buf.sample(16)
+    indices = sample[-1]
+    buf.update_priorities(indices, np.abs(np.random.randn(16)))
+    assert buf.total_priority() > 0
+
+
+def test_per_buffer_can_sample():
+    buf = PERBuffer(capacity=100)
+    s = np.zeros(7, dtype=np.float32)
+    for _ in range(40):
+        buf.add(s, 0, 0.0, s, False)
+    assert buf.can_sample(32) is True
+    assert buf.can_sample(50) is False
+
+
+# ============================================================================
+# NStepPERBuffer tests (Stage C)
+# ============================================================================
+def test_nstep_per_buffer_returns_9_tuple():
+    buf = NStepPERBuffer(capacity=100, n_step=3, gamma=0.99, alpha=0.6, beta=0.4, beta_train_updates=1000)
+    s = np.zeros(7, dtype=np.float32)
+    for _ in range(50):
+        buf.add(s, 0, 0.5, s, False)
+    sample = buf.sample(32)
+    assert len(sample) == 9
+    assert sample[5].shape == (32,)  # gamma_powers
+    assert sample[6].shape == (32,)  # actual_ns
+    assert sample[7].shape == (32, 1)  # weights
+    assert sample[8].shape == (32,)  # indices
+
+
+def test_nstep_per_buffer_done_truncation():
+    buf = NStepPERBuffer(capacity=100, n_step=3, gamma=0.99, alpha=0.6, beta=0.4, beta_train_updates=1000)
+    s = np.zeros(7, dtype=np.float32)
+    buf.add(s, 0, 1.0, s, True)
+    buf.add(s, 0, 0.0, s, False)
+    buf.add(s, 0, 0.0, s, False)
+    buf.add(s, 0, 0.0, s, False)
+    assert buf.can_sample(1)
+
+
+def test_nstep_per_buffer_update_priorities():
+    buf = NStepPERBuffer(capacity=100, n_step=3, gamma=0.99, alpha=0.6, beta=0.4, beta_train_updates=1000)
+    s = np.zeros(7, dtype=np.float32)
+    for _ in range(50):
+        buf.add(s, 0, 0.5, s, False)
+    sample = buf.sample(16)
+    indices = sample[-1]
+    buf.update_priorities(indices, np.abs(np.random.randn(16)))
+    assert buf.total_priority() > 0

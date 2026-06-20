@@ -11,7 +11,7 @@ import torch
 from dqn_agent import DQNAgent
 from flappy_bird_env import FlappyBirdEnv
 from replay_buffer import StateEncoder, ReplayBuffer
-from version_utils import get_git_hash
+from version_utils import get_git_hash, infer_reward_scheme_version
 
 
 def set_global_seed(seed):
@@ -110,7 +110,14 @@ def run_trial(config, trial_id, seed, source='tpe',
     t_start = time.time()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    env = FlappyBirdEnv(seed=seed)
+    reward_config = {
+        'pipe_reward': config.get('pipe_reward', 1.0),
+        'death_ratio': config.get('death_ratio', 1),
+        'alive_ratio': config.get('alive_ratio', 0.0),
+        'reward_scale': config.get('reward_scale', 1.0),
+        'reward_clip': config.get('reward_clip', None),
+    }
+    env = FlappyBirdEnv(seed=seed, reward_config=reward_config)
     encoder = StateEncoder()
 
     agent = DQNAgent(
@@ -141,15 +148,37 @@ def run_trial(config, trial_id, seed, source='tpe',
     train_raw_env_frames = 0
     eval_raw_env_frames = 0
 
-    # Stage B: Buffer selection based on n_step
+    # Stage C: Buffer selection (4 branches: standard / n-step / PER / n-step+PER)
     n_step = config.get('n_step', 1)
-    if n_step > 1:
+    priority = config.get('priority', False)
+
+    if priority and n_step > 1:
+        from replay_buffer import NStepPERBuffer
+        buffer = NStepPERBuffer(
+            capacity=config['buffer_sz'], n_step=n_step, gamma=config['gamma'],
+            alpha=config.get('per_alpha', 0.6),
+            beta=config.get('per_beta_start', 0.4),
+            beta_train_updates=config.get('per_beta_train_updates', 50000),
+            priority_eps=config.get('per_priority_eps', 1e-6),
+        )
+    elif priority:
+        from replay_buffer import PERBuffer
+        buffer = PERBuffer(
+            capacity=config['buffer_sz'],
+            alpha=config.get('per_alpha', 0.6),
+            beta=config.get('per_beta_start', 0.4),
+            beta_train_updates=config.get('per_beta_train_updates', 50000),
+            priority_eps=config.get('per_priority_eps', 1e-6),
+        )
+    elif n_step > 1:
         from replay_buffer import NStepReplayBuffer
         buffer = NStepReplayBuffer(
-            capacity=config['buffer_sz'],
-            n_step=n_step,
-            gamma=config['gamma'],
+            capacity=config['buffer_sz'], n_step=n_step, gamma=config['gamma'],
         )
+    else:
+        buffer = None
+
+    if buffer is not None:
         agent.buffer = buffer
 
     # Warmup (Section 8.2)
@@ -322,10 +351,15 @@ def run_trial(config, trial_id, seed, source='tpe',
         'duration_sec': duration,
         'init_strategy': 'random_init',
         'env_version': 'fixed_env_v1',
-        'reward_scheme_version': 'mvp_reward_v1',
+        'reward_scheme_version': infer_reward_scheme_version(config),
         'code_version': code_version,
         'implementation_version': 'mvp_v0.2',
         'checkpoint_path': checkpoint_path,
+        'death_ratio': config.get('death_ratio', 1),
+        'alive_ratio': config.get('alive_ratio', 0.0),
+        'reward_scale': config.get('reward_scale', 1.0),
+        'reward_clip': config.get('reward_clip', None),
+        'priority': config.get('priority', False),
     }
 
 

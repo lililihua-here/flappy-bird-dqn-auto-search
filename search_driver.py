@@ -28,6 +28,12 @@ BASELINE_CONFIG = {
     'torch_optimizer': 'Adam', 'loss_type': 'Huber', 'grad_clip_norm': 5,
     'reward_pipe': 1.0, 'reward_death': -1.0, 'reward_alive': 0.0,
     'reward_clip': None, 'reward_scale': 1.0,
+    # Stage C + D: V2 fields with V1-compatible defaults
+    'priority': False,
+    'per_alpha': 0.6, 'per_beta_start': 0.4, 'per_beta_train_updates': 50000,
+    'per_priority_eps': 1e-6,
+    'death_ratio': 1, 'alive_ratio': 0.0,
+    'pipe_reward': 1.0,
 }
 
 
@@ -35,7 +41,7 @@ BASELINE_CONFIG = {
 # Search Space -- Optuna parameter definition (Section 10.6)
 # ============================================================================
 def define_search_space(trial):
-    """Define MVP 8-parameter search space.
+    """Define V2 search space with PER and reward ratio parameters.
     Uses scalar categorical choices for Optuna SQLite persistence,
     then maps to actual layer size lists.
     """
@@ -46,7 +52,7 @@ def define_search_space(trial):
     }
     hidden_key = trial.suggest_categorical('hidden_key', ['small', 'medium', 'large'])
     return {
-        # Searchable (Section 10.6)
+        # Searchable (Section 10.6 — V1 baseline)
         'lr': trial.suggest_float('lr', 1e-5, 3e-3, log=True),
         'gamma': trial.suggest_float('gamma', 0.90, 0.999),
         'hidden_key': hidden_key,
@@ -56,9 +62,20 @@ def define_search_space(trial):
         'eps_decay_decision_steps': trial.suggest_int('eps_decay_decision_steps', 10000, 200000),
         'replay_start_size': trial.suggest_categorical('replay_start_size', [1000, 5000, 10000]),
         'train_freq': trial.suggest_categorical('train_freq', [1, 4]),
+        'n_step': trial.suggest_categorical('n_step', [1, 3, 5]),
+        # Stage C: PER parameters
+        'priority': trial.suggest_categorical('priority', [False, True]),
+        'per_alpha': trial.suggest_float('per_alpha', 0.3, 0.8),
+        'per_beta_start': trial.suggest_float('per_beta_start', 0.3, 0.7),
+        'per_beta_train_updates': trial.suggest_int('per_beta_train_updates', 50000, 500000),
+        # Stage D: Reward ratio search
+        'death_ratio': trial.suggest_int('death_ratio', 5, 100),
+        'alive_ratio': trial.suggest_float('alive_ratio', 0.0, 0.01),
+        'reward_scale': trial.suggest_categorical('reward_scale', [0.01, 0.1, 1.0]),
+        'reward_clip': trial.suggest_categorical('reward_clip', [None, 10, 100]),
+        'pipe_reward': 1.0,  # fixed anchor
         # MVP fixed (Section 10.3, 10.4)
         'double_q': True,
-        'n_step': trial.suggest_categorical('n_step', [1, 3, 5]),
         'frame_skip': 1,
         'target_update_mode': 'soft',
         'tau': 0.005,
@@ -70,8 +87,6 @@ def define_search_space(trial):
         'reward_pipe': 1.0,
         'reward_death': -1.0,
         'reward_alive': 0.0,
-        'reward_clip': None,
-        'reward_scale': 1.0,
     }
 
 

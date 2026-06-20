@@ -24,10 +24,16 @@ class FlappyBirdEnv:
     MAX_FALL_SPEED = 10
     PIPE_SPAWN_X = SCREEN_WIDTH
 
-    def __init__(self, seed=None):
+    def __init__(self, seed=None, reward_config=None):
         self.rng = random.Random(seed)
         self.total_raw_env_frames = 0    # P0-1: never reset
         self.episode_raw_env_frames = 0  # P0-1: reset per episode
+        self.reward_config = {
+            'pipe_reward': 1.0, 'death_ratio': 1,
+            'alive_ratio': 0.0, 'reward_scale': 1.0, 'reward_clip': None,
+        }
+        if reward_config:
+            self.reward_config.update(reward_config)
         self.reset()
 
     def reset(self):
@@ -64,16 +70,26 @@ class FlappyBirdEnv:
         )
         hit_boundary = bird_top <= 0 or bird_bottom >= self.SCREEN_HEIGHT
 
+        # Reward computation per V2 spec (ratio -> clip -> scale order)
         reward = 0.0
         if hit_pipe or hit_boundary:
-            reward = -1.0
+            reward = -float(self.reward_config['death_ratio'])
             self.done = True
 
         if self.pipe_x + self.PIPE_WIDTH < self.BIRD_X and not self._scored_current_pipe:
             self.score += 1
             self._scored_current_pipe = True
             if not self.done:
-                reward = 1.0
+                reward = float(self.reward_config['pipe_reward'])
+
+        if not self.done and reward == 0.0:
+            reward = float(self.reward_config['alive_ratio'])
+
+        clip_val = self.reward_config['reward_clip']
+        if clip_val is not None:
+            reward = max(-clip_val, min(clip_val, reward))
+
+        reward *= float(self.reward_config['reward_scale'])
 
         if self.pipe_x < -self.PIPE_WIDTH:
             self.pipe_x = float(self.PIPE_SPAWN_X)

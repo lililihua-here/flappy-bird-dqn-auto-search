@@ -14,7 +14,10 @@ def test_search_space_produces_valid_config():
     def objective(trial):
         config = define_search_space(trial)
         required = ['lr', 'gamma', 'hidden', 'hidden_key', 'eps_start', 'eps_end',
-                    'eps_decay_decision_steps', 'replay_start_size', 'train_freq']
+                    'eps_decay_decision_steps', 'replay_start_size', 'train_freq',
+                    'n_step', 'priority', 'per_alpha', 'per_beta_start',
+                    'per_beta_train_updates', 'death_ratio', 'alive_ratio',
+                    'reward_scale', 'reward_clip', 'pipe_reward']
         for k in required:
             assert k in config, f"Missing: {k}"
         assert 1e-5 <= config['lr'] <= 3e-3
@@ -27,6 +30,15 @@ def test_search_space_produces_valid_config():
         assert config['replay_start_size'] in (1000, 5000, 10000)
         assert config['train_freq'] in (1, 4)
         assert config['n_step'] in (1, 3, 5)
+        assert config['priority'] in (False, True)
+        assert 0.3 <= config['per_alpha'] <= 0.8
+        assert 0.3 <= config['per_beta_start'] <= 0.7
+        assert 50000 <= config['per_beta_train_updates'] <= 500000
+        assert 5 <= config['death_ratio'] <= 100
+        assert 0.0 <= config['alive_ratio'] <= 0.01
+        assert config['reward_scale'] in (0.01, 0.1, 1.0)
+        assert config['reward_clip'] in (None, 10, 100)
+        assert config['pipe_reward'] == 1.0
         return 0.0
 
     study = optuna.create_study(direction='minimize', sampler=optuna.samplers.RandomSampler(seed=42))
