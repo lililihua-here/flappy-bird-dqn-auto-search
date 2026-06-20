@@ -10,6 +10,12 @@ from dqn_agent import DQNAgent
 from flappy_bird_env import FlappyBirdEnv
 from replay_buffer import StateEncoder, ReplayBuffer
 from version_utils import get_git_hash, infer_reward_scheme_version
+from lineage import LineageTracker
+from snapshot import (
+    SNAPSHOT_INTERVAL, load_snapshot, verify_snapshot_compatible,
+    restore_snapshot_to_agent, restore_replay_buffer, restore_rng_state,
+    restore_lineage_from_snapshot, capture_snapshot, save_snapshot,
+)
 
 
 def set_global_seed(seed):
@@ -78,8 +84,19 @@ def run_trial(config, trial_id, seed, source='tpe',
               candidate_min_rate=0.70,
               candidate_min_median=1000,
               eval_max_frames_per_ep=120_000,
-              checkpoint_dir='checkpoints'):
-    """Run one trial from scratch. Returns result dict (Section 14.3)."""
+              checkpoint_dir='checkpoints',
+              # V3.1: snapshot + lineage parameters
+              trial_type='fresh',
+              resume_snapshot_path=None,
+              parent_lineage=None,
+              parent_trial_id=None,
+              parent_snapshot_ref=None,
+              snapshot_interval=None):
+    """Run one trial. Returns result dict (Section 14.3).
+
+    V3.1: When trial_type='fresh' and resume_snapshot_path=None, behavior is
+    identical to V2. resume/warm_start types enable snapshot-driven resume.
+    """
     # P0-6 (v1.3): Set global seeds BEFORE any random operations
     set_global_seed(seed)
 
@@ -157,20 +174,67 @@ def run_trial(config, trial_id, seed, source='tpe',
     if buffer is not None:
         agent.buffer = buffer
 
-    # Warmup (Section 8.2)
-    state_dict = env.reset()
-    for _ in range(config.get('replay_start_size', 5000)):
-        action = random.randint(0, 1)
-        next_dict, reward, done = env.step(action)
-        agent.buffer.add(
-            encoder.encode(state_dict), action, reward,
-            encoder.encode(next_dict), done,
+    # ---- V3.1: Lineage tracker initialization ----
+    if trial_type == "fresh":
+        lineage = LineageTracker(trial_type=trial_type, trial_id=trial_id)
+    else:
+        lineage = None  # created in resume path below
+
+    # ---- V3.1: Strict validation of trial_type + resume_snapshot_path pairing ----
+    if resume_snapshot_path is not None and trial_type == "fresh":
+        raise ValueError(
+            "resume_snapshot_path requires trial_type='resume' or 'warm_start', not 'fresh'"
         )
-        if done:
-            state_dict = env.reset()
-        else:
-            state_dict = next_dict
-    train_raw_env_frames = env.total_raw_env_frames
+    if resume_snapshot_path is None and trial_type != "fresh":
+        raise ValueError(
+            f"trial_type='{trial_type}' requires resume_snapshot_path, but none was provided"
+        )
+
+    # ---- V3.1: Default snapshot_interval ----
+    if snapshot_interval is None:
+        snapshot_interval = SNAPSHOT_INTERVAL
+
+    # ---- V3.1: Resume path — restore from snapshot, skip warmup ----
+    if resume_snapshot_path is not None:
+        snapshot = load_snapshot(resume_snapshot_path)
+        if not verify_snapshot_compatible(snapshot, config):
+            raise ValueError("Snapshot incompatible with current config")
+        restore_snapshot_to_agent(snapshot, agent)
+        agent.buffer = restore_replay_buffer(snapshot, config)
+        restore_rng_state(snapshot)
+        if trial_type == "resume":
+            lineage = restore_lineage_from_snapshot(snapshot)
+        elif trial_type in ("warm_start", "population_inherited"):
+            parent_lineage = restore_lineage_from_snapshot(snapshot)
+            lineage = LineageTracker(
+                trial_type=trial_type, trial_id=trial_id,
+                parent_lineage=parent_lineage,
+                parent_trial_id=snapshot.trial_id,
+                parent_snapshot_ref=str(resume_snapshot_path),
+            )
+        resume_base_frames = lineage.local_train_raw_env_frames
+        env_frames_at_training_start = env.total_raw_env_frames
+        state_dict = env.reset()
+        train_raw_env_frames = env.total_raw_env_frames
+    else:
+        resume_base_frames = 0
+
+        # Warmup (Section 8.2) — V2 behaviour, unchanged
+        state_dict = env.reset()
+        for _ in range(config.get('replay_start_size', 5000)):
+            action = random.randint(0, 1)
+            next_dict, reward, done = env.step(action)
+            agent.buffer.add(
+                encoder.encode(state_dict), action, reward,
+                encoder.encode(next_dict), done,
+            )
+            if done:
+                state_dict = env.reset()
+            else:
+                state_dict = next_dict
+        lineage.add_frames(env.total_raw_env_frames)
+        train_raw_env_frames = env.total_raw_env_frames
+        env_frames_at_training_start = env.total_raw_env_frames
 
     # Training loop
     best_train_score = 0
@@ -185,11 +249,16 @@ def run_trial(config, trial_id, seed, source='tpe',
     status = 'failure'
     failure_reason = 'max_frames_reached'
     eval_call_count = 0
+    last_snapshot_path = ''
+
+    # V3.1: cumulative frames = resume_base + env-local frames
+    train_raw_env_frames = resume_base_frames + env.total_raw_env_frames
 
     while train_raw_env_frames < max_trial_frames:
         state_vec = encoder.encode(state_dict)
         action = agent.act(state_vec, training=True)
         next_dict, reward, done = env.step(action)
+        lineage.add_frames(1)
 
         agent.buffer.add(state_vec, action, reward, encoder.encode(next_dict), done)
 
@@ -197,6 +266,7 @@ def run_trial(config, trial_id, seed, source='tpe',
             loss = agent.train()
             if loss is not None:
                 recent_losses.append(loss)
+                lineage.add_update()
 
         agent.decay_epsilon()
 
@@ -210,7 +280,7 @@ def run_trial(config, trial_id, seed, source='tpe',
             state_dict = next_dict
 
         # P0-1: eval uses independent env, training env total IS train-only
-        train_raw_env_frames = env.total_raw_env_frames
+        train_raw_env_frames = resume_base_frames + env.total_raw_env_frames
 
         # Periodic eval (Section 8.3)
         if train_raw_env_frames > 0 and train_raw_env_frames % eval_interval_frames == 0:
@@ -266,7 +336,13 @@ def run_trial(config, trial_id, seed, source='tpe',
                 failure_reason = stop_reason
                 break
 
-    # Build result
+        # V3.1: Periodic snapshot saving (after eval logic, before next iteration)
+        if train_raw_env_frames > 0 and train_raw_env_frames % snapshot_interval == 0:
+            s = capture_snapshot(agent, env, config, trial_id, seed, source, lineage)
+            path, sha = save_snapshot(s, checkpoint_dir)
+            last_snapshot_path = path
+
+
     final_eval_scores = None
     final_median = 0.0
     final_mean = 0.0
@@ -366,6 +442,25 @@ def run_trial(config, trial_id, seed, source='tpe',
         'per_beta_start': config.get('per_beta_start'),
         'per_beta_train_updates': config.get('per_beta_train_updates'),
         'per_priority_eps': config.get('per_priority_eps'),
+        # V3.1: Lineage and snapshot fields
+        'trial_type': lineage.trial_type,
+        'lineage_chain_id': lineage.lineage_chain_id,
+        'lineage_node_id': lineage.lineage_node_id,
+        'lineage_root_trial_id': lineage.lineage_root_trial_id,
+        'parent_trial_id': lineage.parent_trial_id,
+        'parent_snapshot_ref': lineage.parent_snapshot_ref,
+        'inheritance_depth': lineage.inheritance_depth,
+        'local_train_raw_env_frames': lineage.local_train_raw_env_frames,
+        'lineage_train_raw_env_frames': lineage.lineage_train_raw_env_frames,
+        'train_updates': lineage.train_updates,
+        'last_snapshot_path': last_snapshot_path,
+        'block_raw_env_frames': env.total_raw_env_frames,
+        'replay_buffer_size': len(agent.buffer) if hasattr(agent.buffer, '__len__') else 0,
+        'n_step_queue_length': (
+            len(agent.buffer._n_step_queue)
+            if hasattr(agent.buffer, '_n_step_queue') else 0
+        ),
+        'epsilon': agent.epsilon,
     }
 
 
