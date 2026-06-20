@@ -8,6 +8,45 @@ from replay_buffer import ReplayBuffer
 
 
 # ============================================================================
+# NoisyNet utilities — factorized Gaussian noise (V3.3)
+# ============================================================================
+def _scale_noise(size, device, dtype):
+    """Standard factorized Gaussian noise: f(x) = sign(x) * sqrt(|x|)."""
+    x = torch.randn(size, device=device, dtype=dtype)
+    return x.sign() * x.abs().sqrt()
+
+
+class NoisyLinear(nn.Module):
+    """Factorized Gaussian NoisyNet. Eval mode uses mu (deterministic)."""
+
+    def __init__(self, in_features, out_features, sigma_init=0.5):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.mu_w = nn.Parameter(torch.empty(out_features, in_features))
+        self.sigma_w = nn.Parameter(torch.empty(out_features, in_features))
+        self.mu_b = nn.Parameter(torch.empty(out_features))
+        self.sigma_b = nn.Parameter(torch.empty(out_features))
+        self.reset_parameters(sigma_init)
+
+    def reset_parameters(self, sigma_init):
+        nn.init.kaiming_uniform_(self.mu_w)
+        self.sigma_w.data.fill_(sigma_init / self.in_features ** 0.5)
+        nn.init.zeros_(self.mu_b)
+        self.sigma_b.data.fill_(sigma_init / self.out_features ** 0.5)
+
+    def forward(self, x):
+        if not self.training:
+            return x @ self.mu_w.t() + self.mu_b
+        eps_in = _scale_noise(self.in_features, x.device, x.dtype)
+        eps_out = _scale_noise(self.out_features, x.device, x.dtype)
+        weight_noise = eps_out.unsqueeze(1) * eps_in.unsqueeze(0)
+        weight = self.mu_w + self.sigma_w * weight_noise
+        bias = self.mu_b + self.sigma_b * eps_out
+        return x @ weight.t() + bias
+
+
+# ============================================================================
 # DQN network — configurable MLP
 # ============================================================================
 class DQN(nn.Module):
@@ -28,20 +67,60 @@ class DQN(nn.Module):
 
 
 # ============================================================================
+# NoisyDQN — DQN with NoisyLinear layers (V3.3)
+# ============================================================================
+class NoisyDQN(nn.Module):
+    """DQN with NoisyLinear layers for exploration via parameter noise."""
+
+    def __init__(self, state_dim, hidden, n_actions, sigma_init=0.5):
+        super().__init__()
+        dims = [state_dim] + list(hidden) + [n_actions]
+        layers = []
+        for i in range(len(dims) - 2):
+            layers.append(NoisyLinear(dims[i], dims[i + 1], sigma_init))
+            layers.append(nn.ReLU())
+        layers.append(NoisyLinear(dims[-2], dims[-1], sigma_init))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x.float())
+
+
+# ============================================================================
+# DuelingMLP — Dueling architecture (V3.3)
+# ============================================================================
+class DuelingMLP(nn.Module):
+    """Dueling architecture with full shared feature stack, then value/advantage streams."""
+
+    def __init__(self, state_dim, hidden, n_actions):
+        super().__init__()
+        dims = [state_dim] + list(hidden)
+        layers = []
+        for in_dim, out_dim in zip(dims[:-1], dims[1:]):
+            layers.extend([nn.Linear(in_dim, out_dim), nn.ReLU()])
+        self.feature = nn.Sequential(*layers)
+        last_dim = dims[-1]
+        stream_dim = max(16, last_dim // 2)
+        self.value = nn.Sequential(nn.Linear(last_dim, stream_dim), nn.ReLU(), nn.Linear(stream_dim, 1))
+        self.advantage = nn.Sequential(nn.Linear(last_dim, stream_dim), nn.ReLU(), nn.Linear(stream_dim, n_actions))
+
+    def forward(self, x):
+        f = self.feature(x.float())
+        v = self.value(f)
+        a = self.advantage(f)
+        return v + a - a.mean(dim=1, keepdim=True)
+
+
+# ============================================================================
 # DQN Agent — P0-3/P1-5/P1-8 fixes applied
 # ============================================================================
 class DQNAgent:
     """DQN agent (1-step Double DQN, Adam, Huber loss, soft target update)."""
 
     def __init__(self, config, state_dim, n_actions, device):
-        # P1-8: Assert MVP fixed parameters
-        assert config.get('target_update_mode', 'soft') == 'soft', \
-            "MVP fixed: target_update_mode must be 'soft'"
-        # P1-3 (v1.3): Assert all MVP-fixed params that env/agent hardcode
+        # P1-3 (v1.3): Assert MVP-fixed params that env/agent hardcode
         assert config.get('frame_skip', 1) == 1, \
             "MVP fixed: frame_skip must be 1"
-        assert config.get('torch_optimizer', 'Adam') == 'Adam', \
-            "MVP fixed: torch_optimizer must be 'Adam'"
         assert config.get('loss_type', 'Huber') == 'Huber', \
             "MVP fixed: loss_type must be 'Huber'"
 
@@ -50,19 +129,45 @@ class DQNAgent:
         self.n_actions = n_actions
         self.device = device
 
-        self.q_net = DQN(state_dim, config['hidden'], n_actions).to(device)
-        self.target_net = DQN(state_dim, config['hidden'], n_actions).to(device)
+        # V3.3: network_backbone and exploration_head
+        self.network_backbone = config.get("network_backbone", "mlp")
+        self.exploration_head = config.get("exploration_head", "epsilon_greedy")
+
+        if self.network_backbone == "dueling_mlp":
+            self.q_net = DuelingMLP(state_dim, config['hidden'], n_actions).to(device)
+            self.target_net = DuelingMLP(state_dim, config['hidden'], n_actions).to(device)
+        elif self.network_backbone == "noisy_mlp":
+            self.q_net = NoisyDQN(state_dim, config['hidden'], n_actions).to(device)
+            self.target_net = NoisyDQN(state_dim, config['hidden'], n_actions).to(device)
+        else:
+            self.q_net = DQN(state_dim, config['hidden'], n_actions).to(device)
+            self.target_net = DQN(state_dim, config['hidden'], n_actions).to(device)
         self.target_net.load_state_dict(self.q_net.state_dict())
 
         self.buffer = ReplayBuffer(config['buffer_sz'])
-        self.optimizer = torch.optim.Adam(self.q_net.parameters(), lr=config['lr'])
+
+        # V3.3: selectable optimizer
+        opt_name = config.get('torch_optimizer', 'Adam')
+        if opt_name == 'AdamW':
+            self.optimizer = torch.optim.AdamW(self.q_net.parameters(), lr=config['lr'])
+        elif opt_name == 'RMSprop':
+            self.optimizer = torch.optim.RMSprop(self.q_net.parameters(), lr=config['lr'])
+        else:
+            self.optimizer = torch.optim.Adam(self.q_net.parameters(), lr=config['lr'])
         self.loss_fn = nn.SmoothL1Loss()  # Huber
 
         self.epsilon = float(config['eps_start'])
         self.decision_steps = 0
+        self._train_steps = 0
 
     def act(self, state, training=True):
-        if training:
+        # V3.3: NoisyNet exploration — epsilon not used, noise in layers
+        if self.exploration_head == "noisy_net":
+            if training:
+                self.q_net.train()
+            else:
+                self.q_net.eval()
+        elif training:
             self.decision_steps += 1
             if random.random() < self.epsilon:
                 return random.randint(0, self.n_actions - 1)
@@ -127,10 +232,17 @@ class DQNAgent:
         nn.utils.clip_grad_norm_(self.q_net.parameters(), self.config['grad_clip_norm'])
         self.optimizer.step()
 
-        # Soft target update (MVP fixed)
-        tau = self.config['tau']
-        for tp, p in zip(self.target_net.parameters(), self.q_net.parameters()):
-            tp.data.copy_(tau * p.data + (1.0 - tau) * tp.data)
+        self._train_steps += 1
+
+        # V3.3: target update mode (soft or hard)
+        if self.config.get('target_update_mode', 'soft') == 'hard':
+            hard_freq = self.config.get('hard_update_freq', 1000)
+            if self._train_steps % hard_freq == 0:
+                self.target_net.load_state_dict(self.q_net.state_dict())
+        else:
+            tau = self.config['tau']
+            for tp, p in zip(self.target_net.parameters(), self.q_net.parameters()):
+                tp.data.copy_(tau * p.data + (1.0 - tau) * tp.data)
 
         if per_indices is not None and hasattr(self.buffer, 'update_priorities'):
             with torch.no_grad():

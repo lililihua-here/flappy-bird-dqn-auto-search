@@ -34,6 +34,10 @@ BASELINE_CONFIG = {
     'per_priority_eps': 1e-6,
     'death_ratio': 1, 'alive_ratio': 0.0,
     'pipe_reward': 1.0,
+    # V3.3: network/exploration family defaults
+    'network_backbone': 'mlp',
+    'exploration_head': 'epsilon_greedy',
+    'hard_update_freq': 1000,
 }
 
 
@@ -74,12 +78,15 @@ def define_search_space(trial):
         'reward_scale': trial.suggest_categorical('reward_scale', [0.01, 0.1, 1.0]),
         'reward_clip': trial.suggest_categorical('reward_clip', [None, 10, 100]),
         'pipe_reward': 1.0,  # fixed anchor
+        # V3.3: network/exploration/optimizer/target-update family
+        'network_backbone': trial.suggest_categorical('network_backbone', ['mlp', 'dueling_mlp']),
+        'exploration_head': trial.suggest_categorical('exploration_head', ['epsilon_greedy', 'noisy_net']),
+        'torch_optimizer': trial.suggest_categorical('torch_optimizer', ['Adam', 'AdamW', 'RMSprop']),
+        'target_update_mode': trial.suggest_categorical('target_update_mode', ['soft', 'hard']),
         # MVP fixed (Section 10.3, 10.4)
         'double_q': True,
         'frame_skip': 1,
-        'target_update_mode': 'soft',
         'tau': 0.005,
-        'torch_optimizer': 'Adam',
         'loss_type': 'Huber',
         'grad_clip_norm': 5,
         'batch_sz': 64,
