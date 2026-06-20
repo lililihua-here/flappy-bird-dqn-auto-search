@@ -92,7 +92,9 @@ def run_trial(config, trial_id, seed, source='tpe',
               parent_lineage=None,
               parent_trial_id=None,
               parent_snapshot_ref=None,
-              snapshot_interval=None):
+              snapshot_interval=None,
+              # V3.5: force final eval regardless of candidate verification
+              force_final_eval=False):
     """Run one trial. Returns result dict (Section 14.3).
 
     V3.1: When trial_type='fresh' and resume_snapshot_path=None, behavior is
@@ -350,7 +352,7 @@ def run_trial(config, trial_id, seed, source='tpe',
     final_mean = 0.0
     final_success_rate = 0.0
 
-    if candidate_result is not None:
+    if candidate_result is not None and not force_final_eval:
         final_eval_scores = candidate_result['scores']
         final_median = candidate_result['median']
         final_mean = candidate_result['mean']

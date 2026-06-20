@@ -157,6 +157,12 @@ def make_parser():
     p.add_argument('--render-fps', type=int, default=60)
     p.add_argument('--report', action='store_true',
                    help='Generate V2 experiment reports after baseline/search')
+    p.add_argument('--matrix', choices=['baseline', 'structure', 'protocol', 'searcher'],
+                   help='Run experiment matrix')
+    p.add_argument('--final-confirm', type=str,
+                   help='Run 5-seed final confirm for a config JSON file')
+    p.add_argument('--search-strategy', choices=['tpe_fresh', 'warmstart_tpe', 'population_async'],
+                   default='tpe_fresh')
     return p
 
 
@@ -197,6 +203,32 @@ def main():
         generate_summary(hm)
         if args.report:
             generate_all_reports(hm, args.study_db)
+        return
+
+    if args.matrix:
+        from experiment_matrix import (BASELINE_MATRIX, STRUCTURE_ABLATION,
+                                        PROTOCOL_ABLATION, SEARCHER_COMPARISON,
+                                        run_matrix)
+        matrices = {
+            'baseline': BASELINE_MATRIX,
+            'structure': STRUCTURE_ABLATION,
+            'protocol': PROTOCOL_ABLATION,
+            'searcher': SEARCHER_COMPARISON,
+        }
+        results = run_matrix(matrices[args.matrix], mode=args.mode)
+        print(f"[MATRIX] {args.matrix}: {len(results)} results")
+        return
+
+    if args.final_confirm:
+        import json
+        from experiment_matrix import final_confirm
+        with open(args.final_confirm, 'r') as f:
+            config = json.load(f)
+        result = final_confirm(config)
+        status = result['status']
+        print(f"[FINAL-CONFIRM] {status}: "
+              f"sr={result.get('overall_success_rate_1000', 0):.2f} "
+              f"median={result.get('overall_median_score', 0):.0f}")
         return
 
     driver = SearchDriver(
