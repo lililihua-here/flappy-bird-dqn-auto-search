@@ -156,6 +156,25 @@ def test_is_stable_success_honors_custom_threshold():
 
 
 # ============================================================================
+# run_trial n-step smoke test (Stage B)
+# ============================================================================
+def test_run_trial_with_nstep_3():
+    from train_eval import run_trial
+    from search_driver import BASELINE_CONFIG
+    import tempfile
+    config = dict(BASELINE_CONFIG)
+    config.update({'n_step': 3, 'replay_start_size': 200})
+    with tempfile.TemporaryDirectory() as tmpdir:
+        result = run_trial(config, trial_id=99, seed=42, source='test',
+                           max_trial_frames=2000, eval_interval_frames=500,
+                           eval_episodes=2, candidate_verify_episodes=3,
+                           checkpoint_dir=tmpdir)
+        assert result['config']['n_step'] == 3
+        assert result['n_step'] == 3
+        assert result['status'] in ('success', 'failure')
+
+
+# ============================================================================
 # compute_objective tests
 # ============================================================================
 def test_compute_objective_success_equals_train_frames():

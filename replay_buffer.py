@@ -76,3 +76,83 @@ class ReplayBuffer:
 
     def __len__(self):
         return len(self.buffer)
+
+
+# ============================================================================
+# NStepReplayBuffer -- n-step TD returns with done flush (Stage B)
+# ============================================================================
+class NStepReplayBuffer:
+    """Replay buffer that stores n-step transitions.
+
+    Uses an internal deque to accumulate n consecutive single steps,
+    then computes the n-step return and stores the n-step transition.
+    On done, flushes all remaining partial transitions and clears
+    the queue (P0-3 fix from V2 plan reviews).
+    """
+
+    def __init__(self, capacity, n_step, gamma):
+        self.capacity = int(capacity)
+        self.n_step = int(n_step)
+        self.gamma = float(gamma)
+        self.buffer = deque(maxlen=self.capacity)
+        self._n_step_queue = deque(maxlen=self.n_step)
+
+    def add(self, state, action, reward, next_state, done):
+        self._n_step_queue.append((
+            np.asarray(state, dtype=np.float32),
+            int(action),
+            float(reward),
+            np.asarray(next_state, dtype=np.float32),
+            bool(done),
+        ))
+        if done:
+            self._flush_on_done()
+            return
+        if len(self._n_step_queue) < self.n_step:
+            return
+        self._store_from_queue(0)
+        self._n_step_queue.popleft()
+
+    def _store_from_queue(self, start_idx):
+        s0, a0, _, _, _ = self._n_step_queue[start_idx]
+        n_return = 0.0
+        actual_n = 0
+        for k in range(start_idx, min(start_idx + self.n_step, len(self._n_step_queue))):
+            _, _, r_k, _, d_k = self._n_step_queue[k]
+            n_return += (self.gamma ** actual_n) * r_k
+            actual_n += 1
+            if d_k:
+                break
+        last_idx = start_idx + actual_n - 1
+        next_s = self._n_step_queue[last_idx][3]
+        done_flag = self._n_step_queue[last_idx][4]
+        gamma_power = self.gamma ** actual_n
+        self.buffer.append((
+            s0, a0, float(n_return), next_s, bool(done_flag),
+            float(gamma_power), int(actual_n),
+        ))
+
+    def _flush_on_done(self):
+        """Flush all pending partial n-step transitions on done, then clear queue."""
+        while len(self._n_step_queue) > 0:
+            self._store_from_queue(0)
+            self._n_step_queue.popleft()
+
+    def sample(self, batch_size):
+        batch = random.sample(self.buffer, batch_size)
+        states, actions, n_returns, next_states, dones, gamma_powers, actual_ns = zip(*batch)
+        return (
+            np.stack(states).astype(np.float32),
+            np.asarray(actions, dtype=np.int64),
+            np.asarray(n_returns, dtype=np.float32),
+            np.stack(next_states).astype(np.float32),
+            np.asarray(dones, dtype=np.float32),
+            np.asarray(gamma_powers, dtype=np.float32),
+            np.asarray(actual_ns, dtype=np.int64),
+        )
+
+    def can_sample(self, batch_size):
+        return len(self.buffer) >= batch_size
+
+    def __len__(self):
+        return len(self.buffer)

@@ -26,7 +26,7 @@ def test_search_space_produces_valid_config():
         assert 10000 <= config['eps_decay_decision_steps'] <= 200000
         assert config['replay_start_size'] in (1000, 5000, 10000)
         assert config['train_freq'] in (1, 4)
-        assert config['n_step'] == 1
+        assert config['n_step'] in (1, 3, 5)
         return 0.0
 
     study = optuna.create_study(direction='minimize', sampler=optuna.samplers.RandomSampler(seed=42))

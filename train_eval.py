@@ -141,6 +141,17 @@ def run_trial(config, trial_id, seed, source='tpe',
     train_raw_env_frames = 0
     eval_raw_env_frames = 0
 
+    # Stage B: Buffer selection based on n_step
+    n_step = config.get('n_step', 1)
+    if n_step > 1:
+        from replay_buffer import NStepReplayBuffer
+        buffer = NStepReplayBuffer(
+            capacity=config['buffer_sz'],
+            n_step=n_step,
+            gamma=config['gamma'],
+        )
+        agent.buffer = buffer
+
     # Warmup (Section 8.2)
     state_dict = env.reset()
     for _ in range(config.get('replay_start_size', 5000)):
@@ -288,6 +299,7 @@ def run_trial(config, trial_id, seed, source='tpe',
         'trial_id': trial_id,
         'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S'),
         'config': config,
+        'n_step': config.get('n_step', 1),
         'source': source,
         'seed': seed,
         'status': status,

@@ -58,7 +58,7 @@ def define_search_space(trial):
         'train_freq': trial.suggest_categorical('train_freq', [1, 4]),
         # MVP fixed (Section 10.3, 10.4)
         'double_q': True,
-        'n_step': 1,
+        'n_step': trial.suggest_categorical('n_step', [1, 3, 5]),
         'frame_skip': 1,
         'target_update_mode': 'soft',
         'tau': 0.005,

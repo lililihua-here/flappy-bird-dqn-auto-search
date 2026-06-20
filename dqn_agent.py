@@ -36,8 +36,6 @@ class DQNAgent:
         # P1-8: Assert MVP fixed parameters
         assert config.get('target_update_mode', 'soft') == 'soft', \
             "MVP fixed: target_update_mode must be 'soft'"
-        assert config.get('n_step', 1) == 1, \
-            "MVP fixed: n_step must be 1 (n-step deferred to enhancement)"
         # P1-3 (v1.3): Assert all MVP-fixed params that env/agent hardcode
         assert config.get('frame_skip', 1) == 1, \
             "MVP fixed: frame_skip must be 1"
@@ -81,7 +79,19 @@ class DQNAgent:
         if not self.buffer.can_sample(self.config['batch_sz']):
             return None
 
-        states, actions, rewards, next_states, dones = self.buffer.sample(self.config['batch_sz'])
+        sample = self.buffer.sample(self.config['batch_sz'])
+
+        # Handle both standard (5-tuple) and n-step (7-tuple) buffers
+        gamma_powers_t = None
+
+        if len(sample) == 7:
+            states, actions, rewards, next_states, dones, gamma_powers_arr, _actual_ns = sample
+            gamma_powers_t = torch.from_numpy(gamma_powers_arr).unsqueeze(1).to(self.device)
+        elif len(sample) == 5:
+            states, actions, rewards, next_states, dones = sample
+        else:
+            raise ValueError(f"Unsupported replay sample length: {len(sample)}")
+
         states_t = torch.from_numpy(states).to(self.device)
         actions_t = torch.from_numpy(actions).unsqueeze(1).to(self.device)
         rewards_t = torch.from_numpy(rewards).unsqueeze(1).to(self.device)
@@ -96,8 +106,9 @@ class DQNAgent:
                 next_q = self.target_net(next_states_t).gather(1, next_actions)
             else:
                 next_q = self.target_net(next_states_t).max(1, keepdim=True)[0]
-            # P0-3: 1-step TD target
-            target = rewards_t + (1.0 - dones_t) * self.config['gamma'] * next_q
+            # Per-sample discount: gamma^n for n-step, fixed gamma for 1-step
+            discount = gamma_powers_t if gamma_powers_t is not None else self.config['gamma']
+            target = rewards_t + (1.0 - dones_t) * discount * next_q
 
         loss = self.loss_fn(q_values, target)
         self.optimizer.zero_grad()

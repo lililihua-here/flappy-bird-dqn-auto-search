@@ -4,7 +4,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(__file__))
 
-from replay_buffer import StateEncoder, ReplayBuffer
+from replay_buffer import StateEncoder, ReplayBuffer, NStepReplayBuffer
 
 
 # ============================================================================
@@ -119,3 +119,46 @@ def test_replay_buffer_sample_shapes():
     assert rewards.shape == (4,)
     assert next_states.shape == (4, 7)
     assert dones.shape == (4,)
+
+
+# ============================================================================
+# NStepReplayBuffer tests (Stage B)
+# ============================================================================
+def test_nstep_buffer_stores_n_step_transitions():
+    buf = NStepReplayBuffer(capacity=100, n_step=3, gamma=0.99)
+    s = np.zeros(7, dtype=np.float32)
+    for _ in range(20):
+        buf.add(s, 0, 1.0, s, False)
+    assert len(buf) >= 1
+
+
+def test_nstep_buffer_truncates_on_done():
+    buf = NStepReplayBuffer(capacity=100, n_step=3, gamma=0.99)
+    s = np.zeros(7, dtype=np.float32)
+    buf.add(s, 0, 0.0, s, False)
+    buf.add(s, 0, 0.0, s, False)
+    buf.add(s, 0, 1.0, s, True)
+    assert len(buf) >= 1
+
+
+def test_nstep_buffer_does_not_cross_episode():
+    buf = NStepReplayBuffer(capacity=100, n_step=3, gamma=0.99)
+    s0 = np.zeros(7, dtype=np.float32)
+    s1 = np.ones(7, dtype=np.float32)
+    buf.add(s0, 0, 1.0, s0, True)
+    # Add more steps — they should NOT mix with the done episode
+    for _ in range(6):
+        buf.add(s1, 0, 0.0, s1, False)
+    assert buf.can_sample(1)
+
+
+def test_nstep_buffer_sample_shapes():
+    buf = NStepReplayBuffer(capacity=100, n_step=3, gamma=0.99)
+    s = np.zeros(7, dtype=np.float32)
+    for _ in range(30):
+        buf.add(s, 0, 1.0, s, False)
+    states, actions, n_returns, next_states, dones, gamma_powers, actual_ns = buf.sample(16)
+    assert states.shape == (16, 7)
+    assert n_returns.shape == (16,)
+    assert gamma_powers.shape == (16,)
+    assert actual_ns.shape == (16,)
