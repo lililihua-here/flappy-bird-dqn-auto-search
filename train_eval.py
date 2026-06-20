@@ -9,6 +9,7 @@ import torch
 from dqn_agent import DQNAgent
 from flappy_bird_env import FlappyBirdEnv
 from replay_buffer import StateEncoder, ReplayBuffer
+from state_encoder_variants import get_encoder
 from version_utils import get_git_hash, infer_reward_scheme_version
 from lineage import LineageTracker
 from snapshot import (
@@ -111,7 +112,8 @@ def run_trial(config, trial_id, seed, source='tpe',
         'reward_clip': config.get('reward_clip', None),
     }
     env = FlappyBirdEnv(seed=seed, reward_config=reward_config)
-    encoder = StateEncoder()
+    state_encoder_version = config.get("state_representation_version", "low_dim_v1")
+    encoder = get_encoder(state_encoder_version)
 
     agent = DQNAgent(
         config={
@@ -385,7 +387,9 @@ def run_trial(config, trial_id, seed, source='tpe',
         target_net=agent.target_net,
         config={
             **agent.config,
-            'reward_scheme_version': infer_reward_scheme_version(config),
+            'reward_scheme_version': config.get('reward_scheme_version',
+                                                infer_reward_scheme_version(config)),
+            'state_representation_version': state_encoder_version,
         },
         trial_id=trial_id,
         seed=seed,
@@ -394,6 +398,7 @@ def run_trial(config, trial_id, seed, source='tpe',
         decision_steps=agent.decision_steps,
         state_dim=agent.state_dim,
         n_actions=agent.n_actions,
+        state_representation_version=state_encoder_version,
     )
     checkpoint_prefix = f'{source}_trial_{trial_id}_seed_{seed}'
     checkpoint_path, checkpoint_sha256 = save_checkpoint(
@@ -427,8 +432,9 @@ def run_trial(config, trial_id, seed, source='tpe',
         'duration_sec': duration,
         'init_strategy': 'random_init',
         'environment_version': 'fixed_env_v1',
-        'state_representation_version': 'low_dim_v1',
-        'reward_scheme_version': infer_reward_scheme_version(config),
+        'state_representation_version': state_encoder_version,
+        'reward_scheme_version': config.get('reward_scheme_version',
+                                            infer_reward_scheme_version(config)),
         'code_version': code_version,
         'checkpoint_path': checkpoint_path,
         'checkpoint_sha256': checkpoint_sha256,

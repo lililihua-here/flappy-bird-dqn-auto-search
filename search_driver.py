@@ -87,6 +87,11 @@ def define_search_space(trial):
         'reward_pipe': 1.0,
         'reward_death': -1.0,
         'reward_alive': 0.0,
+        # V3.2: State/reward protocol versioning
+        'state_representation_version': trial.suggest_categorical(
+            'state_representation_version', ['low_dim_v1', 'low_dim_v2', 'low_dim_v3']),
+        'reward_scheme_version': trial.suggest_categorical(
+            'reward_scheme_version', ['reward_v1_sparse', 'reward_v2_ratio', 'reward_v3_gap_shaping']),
     }
 
 

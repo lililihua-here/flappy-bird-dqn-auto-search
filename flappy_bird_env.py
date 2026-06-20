@@ -34,6 +34,7 @@ class FlappyBirdEnv:
         }
         if reward_config:
             self.reward_config.update(reward_config)
+        self.last_events = {}
         self.reset()
 
     def reset(self):
@@ -45,6 +46,7 @@ class FlappyBirdEnv:
         self.done = False
         self._scored_current_pipe = False
         self.episode_raw_env_frames = 0  # P0-1: only episode counter resets
+        self.last_events = {"hit": False, "passed_pipe": False}
         return self._get_state()
 
     def step(self, action):
@@ -95,6 +97,10 @@ class FlappyBirdEnv:
             self.pipe_x = float(self.PIPE_SPAWN_X)
             self.pipe_gap_center = float(self.rng.randint(200, self.SCREEN_HEIGHT - 200))
             self._scored_current_pipe = False
+
+        # V3.2: store events for external reward protocol use
+        self.last_events = {"hit": hit_pipe or hit_boundary,
+                            "passed_pipe": self._scored_current_pipe}
 
         return self._get_state(), reward, self.done
 

@@ -107,6 +107,24 @@ def save_checkpoint(state_dict_or_payload, checkpoint_dir, subdir='', prefix='ch
     return str(path), sha256_hex
 
 
+def normalize_v2_record_to_v3(record):
+    """Normalize a V2 history record to V3 schema with defaults for new fields."""
+    record = dict(record)
+    record.setdefault("trial_type", "fresh")
+    record.setdefault("lineage_chain_id", f"v2_legacy_{record.get('trial_id', 'unknown')}")
+    record.setdefault("lineage_node_id", f"v2_legacy_{record.get('trial_id', 'unknown')}")
+    record.setdefault("lineage_root_trial_id", record.get("trial_id", -1))
+    record.setdefault("local_train_raw_env_frames", record.get("train_raw_env_frames", 0))
+    record.setdefault("lineage_train_raw_env_frames", record.get("train_raw_env_frames", 0))
+    record.setdefault("state_representation_version", record.get("state_representation_version", "low_dim_v1"))
+    record.setdefault("reward_scheme_version", record.get("reward_scheme_version", "reward_v1_sparse"))
+    record.setdefault("checkpoint_capability", "inference_only")
+    record.setdefault("network_backbone", "mlp")
+    record.setdefault("exploration_head", "epsilon_greedy")
+    record.setdefault("search_strategy", "tpe_fresh")
+    return record
+
+
 def is_checkpoint_compatible(record, current_env, current_reward, current_state):
     """Check whether a record/checkpoint matches the current evaluation protocol."""
     return (
