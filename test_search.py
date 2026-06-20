@@ -111,8 +111,10 @@ def test_parser_render_flags():
         '--render-episodes', '2',
         '--render-fps', '30',
         '--checkpoint-dir', 'my_ckpts',
+        '--report',
     ])
     assert args.render is True
     assert args.render_episodes == 2
     assert args.render_fps == 30
     assert args.checkpoint_dir == 'my_ckpts'
+    assert args.report is True

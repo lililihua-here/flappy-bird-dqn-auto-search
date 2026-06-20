@@ -1,15 +1,14 @@
 """Flappy Bird DQN V2 — CLI entrypoint and render demo."""
-import argparse, sys, os, time, hashlib
+import argparse
+import sys
 from pathlib import Path
-import numpy as np
 import torch
 from flappy_bird_env import FlappyBirdEnv
 from replay_buffer import StateEncoder
 from dqn_agent import DQNAgent
-from train_eval import run_trial, greedy_eval, compute_objective
+from train_eval import run_trial, compute_objective
 from search_driver import SearchDriver, BASELINE_CONFIG, get_mode_presets
-from history_reporting import HistoryManager, generate_summary, recheck_top_k
-from version_utils import get_git_hash
+from history_reporting import HistoryManager, generate_summary, generate_all_reports
 
 
 # ============================================================================
@@ -43,7 +42,9 @@ def load_agent_from_checkpoint(checkpoint_path, device=None):
         device=device,
     )
     agent.q_net.load_state_dict(checkpoint['q_net_state_dict'])
-    agent.target_net.load_state_dict(checkpoint['q_net_state_dict'])
+    agent.target_net.load_state_dict(
+        checkpoint.get('target_net_state_dict', checkpoint['q_net_state_dict'])
+    )
     return agent, encoder, checkpoint
 
 
@@ -154,6 +155,8 @@ def make_parser():
                    help='Render the best checkpoint from history using pygame')
     p.add_argument('--render-episodes', type=int, default=1)
     p.add_argument('--render-fps', type=int, default=60)
+    p.add_argument('--report', action='store_true',
+                   help='Generate V2 experiment reports after baseline/search')
     return p
 
 
@@ -192,6 +195,8 @@ def main():
         hm = HistoryManager(args.history)
         hm.append(result)
         generate_summary(hm)
+        if args.report:
+            generate_all_reports(hm, args.study_db)
         return
 
     driver = SearchDriver(
@@ -205,6 +210,8 @@ def main():
 
     try:
         driver.run()
+        if args.report:
+            generate_all_reports(driver.history, args.study_db)
     except KeyboardInterrupt:
         print("\n[EXIT] Interrupted.")
         sys.exit(0)

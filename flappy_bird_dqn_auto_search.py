@@ -9,7 +9,10 @@ from train_eval import (
 from search_driver import SearchDriver, BASELINE_CONFIG, define_search_space, get_mode_presets
 from history_reporting import (
     HistoryManager, generate_summary, recheck_top_k,
-    _make_serializable,
+    _make_serializable, normalize_legacy_record,
+    build_checkpoint_payload, save_checkpoint, is_checkpoint_compatible,
+    generate_experiment_manifest, generate_summary_report_md,
+    generate_topk_summary_json, generate_recheck_summary_json, generate_all_reports,
 )
 from main import (
     main, make_parser,

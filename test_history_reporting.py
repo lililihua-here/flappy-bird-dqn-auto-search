@@ -224,3 +224,86 @@ def test_recheck_top_k_persists_full_summary(monkeypatch):
         assert 'failed_seeds' in recheck_rows[0]
     finally:
         os.unlink(tmp.name)
+
+
+# ============================================================================
+# V2 schema normalization / checkpoint / reports
+# ============================================================================
+def test_normalize_legacy_record_maps_versions_and_per_field():
+    from history_reporting import normalize_legacy_record
+
+    normalized = normalize_legacy_record({
+        'trial_id': 1,
+        'env_version': 'fixed_env_v1',
+        'per_beta_frames': 1234,
+        'config': {'reward_pipe': 1.0, 'reward_death': -10, 'reward_alive': 0.0},
+    })
+
+    assert normalized['record_type'] == 'trial'
+    assert normalized['environment_version'] == 'fixed_env_v1'
+    assert normalized['per_beta_train_updates'] == 1234
+    assert normalized['config']['pipe_reward'] == 1.0
+    assert normalized['config']['death_ratio'] == 10
+    assert normalized['config']['alive_ratio'] == 0.0
+
+
+def test_checkpoint_asset_helpers_roundtrip(tmp_path):
+    import torch
+    from history_reporting import (
+        CHECKPOINT_FORMAT_VERSION, build_checkpoint_payload, save_checkpoint,
+        is_checkpoint_compatible,
+    )
+
+    net = torch.nn.Linear(2, 2)
+    payload = build_checkpoint_payload(
+        q_net=net,
+        target_net=net,
+        config={'hidden': [2], 'reward_scheme_version': 'mvp_reward_v1'},
+        trial_id=0,
+        seed=11,
+        source='baseline',
+        train_raw_env_frames=100,
+        decision_steps=50,
+        state_dim=2,
+        n_actions=2,
+    )
+    path, sha = save_checkpoint(payload, tmp_path, prefix='trial_0')
+
+    assert os.path.exists(path)
+    assert len(sha) == 64
+    assert payload['checkpoint_format_version'] == CHECKPOINT_FORMAT_VERSION
+    assert is_checkpoint_compatible(
+        payload,
+        current_env='fixed_env_v1',
+        current_reward='mvp_reward_v1',
+        current_state='low_dim_v1',
+    ) is True
+
+
+def test_generate_all_reports_creates_expected_files(tmp_path):
+    from history_reporting import HistoryManager, generate_all_reports
+
+    history_path = tmp_path / 'history.jsonl'
+    hm = HistoryManager(str(history_path))
+    hm.append({
+        'trial_id': 0,
+        'status': 'success',
+        'objective': 123.0,
+        'config': {'lr': 1e-4, 'n_step': 1},
+        'median_score': 1100,
+        'success_rate_1000': 0.8,
+        'environment_version': 'fixed_env_v1',
+        'reward_scheme_version': 'mvp_reward_v1',
+        'state_representation_version': 'low_dim_v1',
+        'checkpoint_path': 'checkpoints/trial_0.pt',
+    })
+    hm.append({
+        'record_type': 'recheck',
+        'trial_id': 0,
+        'timestamp': '2026-06-20T12:00:00',
+        'recheck_passed': True,
+    })
+
+    outputs = generate_all_reports(hm, tmp_path / 'study.db', tmp_path)
+    for key, path in outputs.items():
+        assert os.path.exists(path), f'{key} not created'

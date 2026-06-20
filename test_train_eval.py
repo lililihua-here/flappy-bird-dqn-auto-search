@@ -41,13 +41,18 @@ def test_run_trial_baseline_smoke():
             'train_raw_env_frames', 'total_raw_env_frames', 'eval_raw_env_frames',
             'decision_steps', 'episodes', 'best_train_score',
             'best_eval_score', 'duration_sec', 'checkpoint_path',
+            'checkpoint_sha256', 'checkpoint_format_version',
+            'environment_version', 'state_representation_version',
         ]
         for k in required:
             assert k in result, f"Missing: {k}"
         assert result['status'] in ('success', 'failure', 'pruned')
+        assert result['objective'] > 0
         assert result['train_raw_env_frames'] > 0
         assert result['total_raw_env_frames'] == result['train_raw_env_frames'] + result['eval_raw_env_frames']
         assert os.path.exists(result['checkpoint_path'])
+        assert result['environment_version'] == 'fixed_env_v1'
+        assert result['state_representation_version'] == 'low_dim_v1'
 
 
 # ============================================================================

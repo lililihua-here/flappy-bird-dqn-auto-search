@@ -2,9 +2,7 @@
 import math
 import random
 import time
-import subprocess
 from collections import deque
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -69,28 +67,6 @@ def is_stable_success(eval_result, threshold=1000, min_rate=0.70, min_median=100
         success_rate >= min_rate
         and eval_result['median'] >= min_median
     )
-
-
-def _build_checkpoint_path(checkpoint_dir, source, trial_id, seed):
-    checkpoint_root = Path(checkpoint_dir)
-    checkpoint_root.mkdir(parents=True, exist_ok=True)
-    filename = f"{source}_trial_{trial_id}_seed_{seed}.pt"
-    return (checkpoint_root / filename).resolve()
-
-
-def _save_agent_checkpoint(agent, config, trial_id, seed, source, checkpoint_dir):
-    checkpoint_path = _build_checkpoint_path(checkpoint_dir, source, trial_id, seed)
-    payload = {
-        'trial_id': trial_id,
-        'seed': seed,
-        'source': source,
-        'config': config,
-        'state_dim': agent.state_dim,
-        'n_actions': agent.n_actions,
-        'q_net_state_dict': agent.q_net.state_dict(),
-    }
-    torch.save(payload, checkpoint_path)
-    return str(checkpoint_path)
 
 
 def run_trial(config, trial_id, seed, source='tpe',
@@ -198,6 +174,7 @@ def run_trial(config, trial_id, seed, source='tpe',
 
     # Training loop
     best_train_score = 0
+    best_eval_score = 0.0
     best_eval_median = 0.0
     last_improvement_frame = 0
     total_episodes = 0
@@ -249,6 +226,8 @@ def run_trial(config, trial_id, seed, source='tpe',
             if eval_result['median'] > best_eval_median:
                 best_eval_median = eval_result['median']
                 last_improvement_frame = train_raw_env_frames
+            if eval_result['max'] > best_eval_score:
+                best_eval_score = float(eval_result['max'])
             if last_improvement_frame == 0:
                 last_improvement_frame = train_raw_env_frames
 
@@ -312,16 +291,37 @@ def run_trial(config, trial_id, seed, source='tpe',
         final_mean = final_eval['mean']
         final_success_rate = final_eval['success_rate_1000']
 
+    if final_eval_scores:
+        best_eval_score = max(best_eval_score, float(max(final_eval_scores)))
+    best_eval_median = max(best_eval_median, float(final_median))
     total_raw_env_frames = train_raw_env_frames + eval_raw_env_frames
     duration = time.time() - t_start
     code_version = get_git_hash()
-    checkpoint_path = _save_agent_checkpoint(
-        agent=agent,
-        config=agent.config,
+    objective = compute_objective(
+        success=(status == 'success'),
+        train_raw_env_frames=train_raw_env_frames,
+        max_trial_frames=max_trial_frames,
+        best_eval_score=best_eval_score,
+    )
+    from history_reporting import build_checkpoint_payload, save_checkpoint
+    payload = build_checkpoint_payload(
+        q_net=agent.q_net,
+        target_net=agent.target_net,
+        config={
+            **agent.config,
+            'reward_scheme_version': infer_reward_scheme_version(config),
+        },
         trial_id=trial_id,
         seed=seed,
         source=source,
-        checkpoint_dir=checkpoint_dir,
+        train_raw_env_frames=train_raw_env_frames,
+        decision_steps=agent.decision_steps,
+        state_dim=agent.state_dim,
+        n_actions=agent.n_actions,
+    )
+    checkpoint_prefix = f'{source}_trial_{trial_id}_seed_{seed}'
+    checkpoint_path, checkpoint_sha256 = save_checkpoint(
+        payload, checkpoint_dir, prefix=checkpoint_prefix
     )
 
     return {
@@ -332,7 +332,7 @@ def run_trial(config, trial_id, seed, source='tpe',
         'source': source,
         'seed': seed,
         'status': status,
-        'objective': 0.0,
+        'objective': objective,
         'train_raw_env_frames': train_raw_env_frames,
         'total_raw_env_frames': total_raw_env_frames,
         'eval_raw_env_frames': eval_raw_env_frames,
@@ -340,7 +340,7 @@ def run_trial(config, trial_id, seed, source='tpe',
         'episodes': total_episodes,
         'record_type': 'trial',
         'best_train_score': best_train_score,
-        'best_eval_score': float(best_eval_median),
+        'best_eval_score': float(best_eval_score),
         'best_eval_median_score': float(best_eval_median),
         'final_eval_scores': final_eval_scores,
         'success_rate_1000': final_success_rate,
@@ -350,16 +350,22 @@ def run_trial(config, trial_id, seed, source='tpe',
         'early_stop_reason': failure_reason if status != 'success' else '',
         'duration_sec': duration,
         'init_strategy': 'random_init',
-        'env_version': 'fixed_env_v1',
+        'environment_version': 'fixed_env_v1',
+        'state_representation_version': 'low_dim_v1',
         'reward_scheme_version': infer_reward_scheme_version(config),
         'code_version': code_version,
-        'implementation_version': 'mvp_v0.2',
         'checkpoint_path': checkpoint_path,
+        'checkpoint_sha256': checkpoint_sha256,
+        'checkpoint_format_version': payload['checkpoint_format_version'],
         'death_ratio': config.get('death_ratio', 1),
         'alive_ratio': config.get('alive_ratio', 0.0),
         'reward_scale': config.get('reward_scale', 1.0),
         'reward_clip': config.get('reward_clip', None),
         'priority': config.get('priority', False),
+        'per_alpha': config.get('per_alpha'),
+        'per_beta_start': config.get('per_beta_start'),
+        'per_beta_train_updates': config.get('per_beta_train_updates'),
+        'per_priority_eps': config.get('per_priority_eps'),
     }
 
 
