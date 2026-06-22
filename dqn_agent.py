@@ -133,10 +133,12 @@ class DQNAgent:
         self.network_backbone = config.get("network_backbone", "mlp")
         self.exploration_head = config.get("exploration_head", "epsilon_greedy")
 
+        use_noisy_layers = self.exploration_head == "noisy_net"
+
         if self.network_backbone == "dueling_mlp":
             self.q_net = DuelingMLP(state_dim, config['hidden'], n_actions).to(device)
             self.target_net = DuelingMLP(state_dim, config['hidden'], n_actions).to(device)
-        elif self.network_backbone == "noisy_mlp":
+        elif use_noisy_layers:
             self.q_net = NoisyDQN(state_dim, config['hidden'], n_actions).to(device)
             self.target_net = NoisyDQN(state_dim, config['hidden'], n_actions).to(device)
         else:
@@ -158,12 +160,13 @@ class DQNAgent:
 
         self.epsilon = float(config['eps_start'])
         self.decision_steps = 0
-        self._train_steps = 0
+        self.train_updates = 0
 
     def act(self, state, training=True):
         # V3.3: NoisyNet exploration — epsilon not used, noise in layers
         if self.exploration_head == "noisy_net":
             if training:
+                self.decision_steps += 1
                 self.q_net.train()
             else:
                 self.q_net.eval()
@@ -232,12 +235,15 @@ class DQNAgent:
         nn.utils.clip_grad_norm_(self.q_net.parameters(), self.config['grad_clip_norm'])
         self.optimizer.step()
 
-        self._train_steps += 1
+        self.train_updates += 1
 
         # V3.3: target update mode (soft or hard)
         if self.config.get('target_update_mode', 'soft') == 'hard':
-            hard_freq = self.config.get('hard_update_freq', 1000)
-            if self._train_steps % hard_freq == 0:
+            hard_freq = self.config.get(
+                'hard_update_interval_decision_steps',
+                self.config.get('hard_update_freq', 1000),
+            )
+            if self.train_updates % hard_freq == 0:
                 self.target_net.load_state_dict(self.q_net.state_dict())
         else:
             tau = self.config['tau']

@@ -9,10 +9,11 @@ import torch
 
 from train_eval import run_trial
 from version_utils import get_git_hash
+from workflow_metrics import aggregate_trials_for_workflow, normalize_failure_reason
 
 
-CHECKPOINT_FORMAT_VERSION = 'v2_checkpoint_1'
-REPORT_VERSION = 'v2.0'
+CHECKPOINT_FORMAT_VERSION = 'v3_checkpoint_1'
+REPORT_VERSION = 'v3.0'
 DEFAULT_ENVIRONMENT_VERSION = 'fixed_env_v1'
 DEFAULT_STATE_REPRESENTATION_VERSION = 'low_dim_v1'
 
@@ -46,8 +47,8 @@ def normalize_legacy_record(record):
         normalized['environment_version'] = normalized.get(
             'env_version', 'unknown_env_version'
         )
-    normalized.setdefault('state_representation_version', 'unknown_state_version')
-    normalized.setdefault('reward_scheme_version', 'mvp_reward_v1')
+    normalized.setdefault('state_representation_version', 'low_dim_v1')
+    normalized.setdefault('reward_scheme_version', 'reward_v1_sparse')
 
     config = dict(normalized.get('config', {}))
     if 'reward_pipe' in config and 'pipe_reward' not in config:
@@ -77,7 +78,7 @@ def build_checkpoint_payload(q_net, target_net, config, trial_id, seed, source,
         'code_version': get_git_hash(),
         'environment_version': environment_version,
         'state_representation_version': state_representation_version,
-        'reward_scheme_version': config.get('reward_scheme_version', 'mvp_reward_v1'),
+        'reward_scheme_version': config.get('reward_scheme_version', 'reward_v1_sparse'),
         'reward_config': reward_config,
         'trial_id': trial_id,
         'seed': seed,
@@ -157,7 +158,7 @@ class HistoryManager:
                 if not line:
                     continue
                 try:
-                    rows.append(normalize_legacy_record(json.loads(line)))
+                    rows.append(normalize_v2_record_to_v3(normalize_legacy_record(json.loads(line))))
                 except json.JSONDecodeError:
                     continue
         return rows
@@ -220,6 +221,12 @@ class HistoryManager:
         return sorted_rows[:k]
 
 
+def load_raw_trial_rows(history_path):
+    """Load raw trial rows from a history JSONL path."""
+    rows = HistoryManager(history_path).load()
+    return [row for row in rows if row.get('record_type', 'trial') == 'trial']
+
+
 def generate_summary(history, top_k=5):
     """Print a compact summary and return it as a dict for tests."""
     rows = history.load()
@@ -271,8 +278,25 @@ def generate_summary(history, top_k=5):
     return summary
 
 
+def export_best_config(history, output_path='best_config.json'):
+    """Write the current best trial config to a standalone JSON file."""
+    best = history.best_trial()
+    if not best:
+        return None
+    config = best.get('config') or {}
+    if not config:
+        return None
+    path = Path(output_path)
+    path.write_text(
+        json.dumps(_make_serializable(config), ensure_ascii=False, indent=2),
+        encoding='utf-8',
+    )
+    return str(path)
+
+
 def recheck_top_k(history, k=5, recheck_seeds=(101, 202, 303),
-                  max_trial_frames=1_000_000, eval_episodes=20):
+                  max_trial_frames=1_000_000, eval_episodes=20,
+                  source='recheck', output_path=None, output_dir=None):
     """Re-evaluate top K configs with multiple independent seeds."""
     top_configs = history.top_k(k)
     results = []
@@ -284,7 +308,7 @@ def recheck_top_k(history, k=5, recheck_seeds=(101, 202, 303),
         seed_scores = []
         for seed in recheck_seeds:
             result = run_trial(
-                config=config, trial_id=-1, seed=seed, source='recheck',
+                config=config, trial_id=-1, seed=seed, source=source,
                 max_trial_frames=max_trial_frames,
                 eval_episodes=eval_episodes,
             )
@@ -328,6 +352,17 @@ def recheck_top_k(history, k=5, recheck_seeds=(101, 202, 303),
             'recheck_seeds_used': list(recheck_seeds),
         }
         history.append(recheck_record)
+
+    if output_dir is not None and output_path is None:
+        output_path = Path(output_dir) / 'recheck_summary.json'
+    if output_path is not None:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps({
+            'k': k,
+            'recheck_seeds_used': list(recheck_seeds),
+            'results': results,
+        }, ensure_ascii=False, indent=2), encoding='utf-8')
 
     return results
 

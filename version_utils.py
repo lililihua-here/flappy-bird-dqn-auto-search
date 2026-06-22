@@ -30,6 +30,8 @@ def infer_reward_scheme_version(config):
         and config.get('reward_clip', None) is None
         and config.get('pipe_reward', 1.0) == 1.0
     )
+    if config.get('gap_shaping_coef', 0.0) not in (0, 0.0, None):
+        return 'reward_v3_gap_shaping'
     if is_mvp_reward:
-        return 'mvp_reward_v1'
-    return 'v2_reward_search'
+        return 'reward_v1_sparse'
+    return 'reward_v2_ratio'

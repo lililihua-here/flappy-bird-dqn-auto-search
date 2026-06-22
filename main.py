@@ -1,5 +1,6 @@
 """Flappy Bird DQN V2 — CLI entrypoint and render demo."""
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -139,6 +140,38 @@ def render_best_demo(history_path='search_history.jsonl', episodes=1, fps=60,
 # ============================================================================
 # CLI Entrypoint
 # ============================================================================
+MATRIX_CHOICES = {
+    'baseline': 'BASELINE_MATRIX',
+    'structure': 'STRUCTURE_ABLATION',
+    'protocol': 'PROTOCOL_ABLATION',
+    'searcher': 'SEARCHER_COMPARISON',
+}
+
+
+def get_matrix_by_name(name):
+    if name not in MATRIX_CHOICES:
+        raise ValueError(f'Unknown matrix: {name}')
+    from experiment_matrix import (
+        BASELINE_MATRIX,
+        STRUCTURE_ABLATION,
+        PROTOCOL_ABLATION,
+        SEARCHER_COMPARISON,
+    )
+
+    matrices = {
+        'baseline': BASELINE_MATRIX,
+        'structure': STRUCTURE_ABLATION,
+        'protocol': PROTOCOL_ABLATION,
+        'searcher': SEARCHER_COMPARISON,
+    }
+    return matrices[name]
+
+
+def load_json_config(path):
+    with open(path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
 def make_parser():
     p = argparse.ArgumentParser(description='Flappy Bird DQN Auto-Search System')
     p.add_argument('--mode', choices=['debug', 'normal', 'deep'], default='normal')
@@ -155,7 +188,30 @@ def make_parser():
     p.add_argument('--render-episodes', type=int, default=1)
     p.add_argument('--render-fps', type=int, default=60)
     p.add_argument('--report', action='store_true',
-                   help='Generate V2 experiment reports after baseline/search')
+                   help='Generate experiment reports after baseline/search')
+    p.add_argument('--search-strategy',
+                   choices=['tpe_fresh', 'warmstart_tpe', 'population_async'],
+                   default='tpe_fresh',
+                   help='Select the V3 search strategy')
+    p.add_argument('--resume', type=str,
+                   help='Resume from a V3 snapshot path (same-trial continue)')
+    p.add_argument('--recheck-topk', type=int,
+                   help='Recheck the top K configs from history')
+    p.add_argument('--final-confirm', type=str,
+                   help='Run 5-seed final confirm for a config JSON file')
+    p.add_argument('--matrix', choices=sorted(MATRIX_CHOICES.keys()),
+                   help='Run a predefined experiment matrix')
+    p.add_argument('--matrix-budget', choices=['debug_matrix', 'normal_matrix'],
+                   default='debug_matrix',
+                   help='Budget profile for --matrix')
+    p.add_argument('--population-size', type=int, default=4,
+                   help='Population size for population_async search')
+    p.add_argument('--population-eval-interval', type=int, default=20_000,
+                   help='Frames per worker block in population_async search')
+    p.add_argument('--population-exploit-interval', type=int, default=50_000,
+                   help='Global frames between exploit/explore steps')
+    p.add_argument('--population-total-frame-budget', type=int, default=None,
+                   help='Total frame budget for population_async search')
     p.add_argument('--n-step', type=int, choices=[1, 3, 5], default=None,
                    help='Override n_step for baseline/search')
     p.add_argument('--priority', action='store_true',
@@ -204,15 +260,77 @@ def main():
         )
         return
 
+    from experiment_matrix import final_confirm, run_matrix, summarize_matrix_results
+    from snapshot import load_snapshot
     from train_eval import run_trial, compute_objective
     from search_driver import SearchDriver, BASELINE_CONFIG, get_mode_presets
-    from history_reporting import HistoryManager, generate_summary, generate_all_reports
+    from history_reporting import (
+        HistoryManager, export_best_config, generate_summary, generate_all_reports, recheck_top_k,
+    )
 
     presets = get_mode_presets(args.mode)
     max_trial_frames = args.max_trial_frames or presets['max_trial_frames']
     config_overrides = _collect_config_overrides(args)
 
     print(f"[MODE] {args.mode}  |  max_trial_frames={max_trial_frames}", flush=True)
+
+    if args.resume:
+        snapshot = load_snapshot(args.resume)
+        resume_config = dict(snapshot.config)
+        for key, value in config_overrides.items():
+            if value is not None:
+                resume_config[key] = value
+        result = run_trial(
+            config=resume_config,
+            trial_id=snapshot.trial_id,
+            seed=snapshot.seed,
+            source='resume',
+            trial_type='resume',
+            resume_snapshot_path=args.resume,
+            max_trial_frames=max_trial_frames,
+            max_additional_train_raw_env_frames=max_trial_frames,
+            eval_interval_frames=presets['eval_interval_frames'],
+            eval_episodes=presets['eval_episodes'],
+            checkpoint_dir=args.checkpoint_dir,
+        )
+        hm = HistoryManager(args.history)
+        hm.append(result)
+        export_best_config(hm)
+        generate_summary(hm)
+        if args.report:
+            generate_all_reports(hm, args.study_db)
+        return
+
+    if args.recheck_topk:
+        hm = HistoryManager(args.history)
+        recheck_results = recheck_top_k(
+            hm,
+            k=args.recheck_topk,
+            max_trial_frames=max_trial_frames,
+            eval_episodes=20,
+        )
+        print(f"[RECHECK] Rechecked top {len(recheck_results)} configs.")
+        if args.report:
+            generate_all_reports(hm, args.study_db)
+        return
+
+    if args.final_confirm:
+        config = load_json_config(args.final_confirm)
+        result = final_confirm(
+            config,
+            max_trial_frames=max_trial_frames,
+            checkpoint_dir=args.checkpoint_dir,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if args.matrix:
+        matrix = get_matrix_by_name(args.matrix)
+        results = run_matrix(matrix, mode=args.mode, budget=args.matrix_budget)
+        summary = summarize_matrix_results(args.matrix, results)
+        summary['budget'] = args.matrix_budget
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return
 
     if args.baseline_only:
         print("[BASELINE-ONLY] Running single baseline trial...")
@@ -236,6 +354,7 @@ def main():
         result['objective'] = obj
         hm = HistoryManager(args.history)
         hm.append(result)
+        export_best_config(hm)
         generate_summary(hm)
         if args.report:
             generate_all_reports(hm, args.study_db)
@@ -252,7 +371,17 @@ def main():
     )
 
     try:
-        driver.run()
+        if args.search_strategy == 'warmstart_tpe':
+            driver.run_warmstart_tpe()
+        elif args.search_strategy == 'population_async':
+            driver.run_population_async(
+                total_frame_budget=args.population_total_frame_budget,
+                population_size=args.population_size,
+                eval_interval=args.population_eval_interval,
+                exploit_interval=args.population_exploit_interval,
+            )
+        else:
+            driver.run()
         if args.report:
             generate_all_reports(driver.history, args.study_db)
     except KeyboardInterrupt:

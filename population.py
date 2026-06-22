@@ -10,12 +10,14 @@ class PopulationController:
 
     def __init__(self, population_size=4, history=None,
                  eval_interval=20_000, exploit_interval=50_000,
+                 checkpoint_dir='checkpoints',
                  bottom_fraction=0.25, top_fraction=0.25):
         self.population_size = population_size
         self.workers = []
         self.history = history
         self.eval_interval = eval_interval
         self.exploit_interval = exploit_interval
+        self.checkpoint_dir = checkpoint_dir
         self.bottom_fraction = bottom_fraction
         self.top_fraction = top_fraction
         self.total_frames = 0
@@ -64,7 +66,9 @@ class PopulationController:
             resume_snapshot_path=resume_path,
             parent_trial_id=worker.get("parent_trial_id"),
             parent_snapshot_ref=worker.get("parent_snapshot_ref"),
-            max_trial_frames=block_frames,
+            max_trial_frames=worker.get("lineage_train_raw_env_frames", 0) + block_frames,
+            max_additional_train_raw_env_frames=block_frames,
+            checkpoint_dir=self.checkpoint_dir,
         )
         # Build lineage dict from run_trial's flat result fields
         lin = {
@@ -84,24 +88,21 @@ class PopulationController:
         worker["local_train_raw_env_frames"] = worker["lineage"].get("local_train_raw_env_frames", 0)
         worker["lineage_train_raw_env_frames"] = worker["lineage"].get("lineage_train_raw_env_frames", 0)
         worker["resume_snapshot_path"] = None
+        if self.history is not None:
+            self.history.append(result)
         return result.get("block_raw_env_frames", block_frames)
 
     def _eval_worker(self, worker):
-        from snapshot import load_snapshot
-        from dqn_agent import DQNAgent
-        from flappy_bird_env import FlappyBirdEnv
-        from state_encoder_variants import get_encoder
         import torch
+        from flappy_bird_env import FlappyBirdEnv
+        from snapshot import load_agent_and_encoder_from_snapshot
+
         if not worker["snapshot_path"]:
             return 0
-        snapshot = load_snapshot(worker["snapshot_path"])
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        state_ver = getattr(snapshot, 'state_representation_version', 'low_dim_v1')
-        encoder = get_encoder(state_ver)
-        state_dim = encoder.state_dim
-        agent = DQNAgent(dict(snapshot.config), state_dim, 2, device)
-        agent.q_net.load_state_dict(snapshot.q_net_state_dict)
-        agent.q_net.eval()
+        agent, encoder, _snapshot = load_agent_and_encoder_from_snapshot(
+            worker["snapshot_path"], device=device
+        )
         scores = []
         for ep in range(20):
             env = FlappyBirdEnv(seed=worker["seed"] + 1000 + ep)

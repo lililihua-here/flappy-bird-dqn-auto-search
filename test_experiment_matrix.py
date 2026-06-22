@@ -53,6 +53,18 @@ def test_protocol_ablation_has_five_entries():
     assert len(PROTOCOL_ABLATION) == 5
 
 
+def test_protocol_ablation_reward_variants_have_effective_params():
+    from experiment_matrix import PROTOCOL_ABLATION
+
+    by_name = {entry["name"]: entry for entry in PROTOCOL_ABLATION}
+    v2 = by_name["v1_state_v2_reward"]["config"]
+    v3 = by_name["v1_state_v3_reward"]["config"]
+
+    assert v2["death_ratio"] > 1
+    assert v2["reward_scale"] in (0.01, 0.1, 1.0)
+    assert v3["gap_shaping_coef"] > 0.0
+
+
 def test_searcher_comparison_has_three_entries():
     from experiment_matrix import SEARCHER_COMPARISON
     assert len(SEARCHER_COMPARISON) == 3
@@ -139,3 +151,242 @@ def test_run_matrix_unknown_budget_raises():
     from experiment_matrix import run_matrix
     with pytest.raises(ValueError, match="Unknown budget"):
         run_matrix([], mode="debug", budget="invalid_budget")
+
+
+def test_run_matrix_skips_missing_config_path(tmp_path, monkeypatch):
+    from experiment_matrix import run_matrix
+
+    monkeypatch.chdir(tmp_path)
+    results = run_matrix([
+        {'name': 'missing_config', 'config_path': 'best_config.json', 'seeds': 1},
+    ], mode='debug', budget='debug_matrix')
+
+    assert len(results) == 1
+    assert results[0]['status'] == 'skipped'
+    assert 'missing config_path' in results[0]['reason']
+
+
+def test_structure_ablation_uses_best_config_base_when_available(tmp_path, monkeypatch):
+    import json
+    import train_eval
+    from experiment_matrix import run_matrix
+
+    captured = []
+
+    def fake_run_trial(config, trial_id, seed, source, max_trial_frames):
+        captured.append({
+            'config': dict(config),
+            'trial_id': trial_id,
+            'seed': seed,
+            'source': source,
+            'max_trial_frames': max_trial_frames,
+        })
+        return {
+            'record_type': 'trial',
+            'trial_id': trial_id,
+            'source': source,
+            'status': 'failure',
+            'objective': 123.0,
+            'median_score': 10.0,
+            'success_rate_1000': 0.0,
+        }
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(train_eval, 'run_trial', fake_run_trial)
+    (tmp_path / 'best_config.json').write_text(json.dumps({
+        'lr': 0.000321,
+        'gamma': 0.97,
+        'network_backbone': 'mlp',
+        'exploration_head': 'epsilon_greedy',
+    }), encoding='utf-8')
+
+    run_matrix([
+        {
+            'name': 'dueling_noisy',
+            'base_config_path': 'best_config.json',
+            'network_backbone': 'dueling_mlp',
+            'exploration_head': 'noisy_net',
+        },
+    ], mode='debug', budget='debug_matrix')
+
+    assert len(captured) == 1
+    assert captured[0]['config']['lr'] == 0.000321
+    assert captured[0]['config']['gamma'] == 0.97
+    assert captured[0]['config']['network_backbone'] == 'dueling_mlp'
+    assert captured[0]['config']['exploration_head'] == 'noisy_net'
+
+
+def test_protocol_ablation_falls_back_to_baseline_when_best_config_missing(tmp_path, monkeypatch):
+    import train_eval
+    from experiment_matrix import run_matrix
+    from search_driver import BASELINE_CONFIG
+
+    captured = []
+
+    def fake_run_trial(config, trial_id, seed, source, max_trial_frames):
+        captured.append(dict(config))
+        return {
+            'record_type': 'trial',
+            'trial_id': trial_id,
+            'source': source,
+            'status': 'failure',
+            'objective': 123.0,
+            'median_score': 0.0,
+            'success_rate_1000': 0.0,
+        }
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(train_eval, 'run_trial', fake_run_trial)
+
+    run_matrix([
+        {'name': 'v1_state_v3_reward',
+         'state_representation_version': 'low_dim_v1',
+         'reward_scheme_version': 'reward_v3_gap_shaping'},
+    ], mode='debug', budget='debug_matrix')
+
+    assert len(captured) == 1
+    assert captured[0]['lr'] == BASELINE_CONFIG['lr']
+    assert captured[0]['gamma'] == BASELINE_CONFIG['gamma']
+    assert captured[0]['state_representation_version'] == 'low_dim_v1'
+    assert captured[0]['reward_scheme_version'] == 'reward_v3_gap_shaping'
+    assert captured[0]['gap_shaping_coef'] == 0.05
+
+
+def test_run_matrix_supports_output_dir_and_custom_source(tmp_path, monkeypatch):
+    import train_eval
+    from experiment_matrix import run_matrix
+
+    captured = []
+
+    def fake_run_trial(config, trial_id, seed, source, max_trial_frames):
+        captured.append(source)
+        return {
+            'record_type': 'trial',
+            'trial_id': trial_id,
+            'source': source,
+            'status': 'failure',
+            'objective': 123.0,
+            'median_score': 10.0,
+            'success_rate_1000': 0.0,
+        }
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(train_eval, 'run_trial', fake_run_trial)
+
+    output_dir = tmp_path / 'matrix_out'
+    run_matrix([
+        {
+            'name': 'dueling_noisy',
+            'network_backbone': 'dueling_mlp',
+            'exploration_head': 'noisy_net',
+        },
+    ], mode='debug', budget='debug_matrix', output_dir=output_dir, source='auto_workflow')
+
+    assert captured == ['auto_workflow_dueling_noisy']
+    assert (output_dir / 'history.jsonl').exists()
+    assert (output_dir / 'summary.json').exists()
+
+
+def test_final_confirm_supports_output_path(tmp_path, monkeypatch):
+    import train_eval
+    from experiment_matrix import final_confirm
+
+    fake_results = iter([
+        {
+            'status': 'success',
+            'final_eval_scores': [1000] * 20,
+        }
+        for _ in range(5)
+    ])
+
+    monkeypatch.setattr(train_eval, 'run_trial', lambda *args, **kwargs: next(fake_results))
+    output_path = tmp_path / 'final_confirm_summary.json'
+    result = final_confirm({'lr': 1e-4}, output_path=output_path, source='auto_workflow_final')
+
+    assert result['status'] == 'confirmed'
+    assert output_path.exists()
+
+
+def test_final_confirm_supports_output_dir(tmp_path, monkeypatch):
+    import train_eval
+    from experiment_matrix import final_confirm
+
+    fake_results = iter([
+        {
+            'status': 'success',
+            'final_eval_scores': [1000] * 20,
+        }
+        for _ in range(5)
+    ])
+
+    monkeypatch.setattr(train_eval, 'run_trial', lambda *args, **kwargs: next(fake_results))
+    output_dir = tmp_path / 'final_confirm_out'
+    result = final_confirm({'lr': 1e-4}, output_dir=output_dir, source='auto_workflow_final')
+
+    assert result['status'] == 'confirmed'
+    assert (output_dir / 'final_confirm_summary.json').exists()
+
+
+def test_summarize_matrix_results_groups_entry_details():
+    from experiment_matrix import summarize_matrix_results
+
+    summary = summarize_matrix_results('protocol', [
+        {
+            'record_type': 'trial',
+            'trial_id': 1,
+            'source': 'matrix_v1_state_v1_reward',
+            'status': 'failure',
+            'objective': 999.0,
+            'median_score': 12.0,
+            'success_rate_1000': 0.0,
+            'failure_reason': 'max_frames_reached',
+        },
+        {
+            'record_type': 'trial',
+            'trial_id': 2,
+            'source': 'matrix_v1_state_v1_reward',
+            'status': 'success',
+            'objective': 555.0,
+            'median_score': 1000.0,
+            'success_rate_1000': 0.7,
+            'failure_reason': '',
+        },
+        {
+            'record_type': 'matrix_entry',
+            'name': 'missing_config',
+            'status': 'skipped',
+            'reason': 'missing config_path: X',
+        },
+    ])
+
+    assert summary['matrix'] == 'protocol'
+    assert len(summary['entries']) == 2
+    by_name = {entry['name']: entry for entry in summary['entries']}
+    assert by_name['missing_config']['status'] == 'skipped'
+    grouped = by_name['v1_state_v1_reward']
+    assert grouped['name'] == 'v1_state_v1_reward'
+    assert grouped['trial_count'] == 2
+    assert grouped['success_count'] == 1
+    assert grouped['best_median_score'] == 1000.0
+
+
+def test_summarize_matrix_results_accepts_searcher_entry_name():
+    from experiment_matrix import summarize_matrix_results
+
+    summary = summarize_matrix_results('searcher', [
+        {
+            'record_type': 'trial',
+            'trial_id': 10,
+            'matrix_entry_name': 'warmstart_tpe',
+            'source': 'tpe',
+            'status': 'failure',
+            'objective': 777.0,
+            'median_score': 25.0,
+            'success_rate_1000': 0.0,
+            'failure_reason': 'max_frames_reached',
+        },
+    ])
+
+    assert len(summary['entries']) == 1
+    assert summary['entries'][0]['name'] == 'warmstart_tpe'
+    assert summary['entries'][0]['trial_count'] == 1

@@ -99,10 +99,42 @@ class FlappyBirdEnv:
             self._scored_current_pipe = False
 
         # V3.2: store events for external reward protocol use
-        self.last_events = {"hit": hit_pipe or hit_boundary,
-                            "passed_pipe": self._scored_current_pipe}
+        self.last_events = {
+            "hit": hit_pipe or hit_boundary,
+            "passed_pipe": self._scored_current_pipe,
+        }
 
         return self._get_state(), reward, self.done
+
+    def capture_runtime_state(self):
+        """Return the full mutable runtime state needed for deterministic resume."""
+        return {
+            'bird_y': self.bird_y,
+            'bird_velocity': self.bird_velocity,
+            'pipe_x': self.pipe_x,
+            'pipe_gap_center': self.pipe_gap_center,
+            'score': self.score,
+            'done': self.done,
+            '_scored_current_pipe': self._scored_current_pipe,
+            'total_raw_env_frames': self.total_raw_env_frames,
+            'episode_raw_env_frames': self.episode_raw_env_frames,
+            'last_events': dict(getattr(self, 'last_events', {})),
+            'rng_state': self.rng.getstate(),
+        }
+
+    def restore_runtime_state(self, runtime_state):
+        """Restore a previously captured runtime state."""
+        self.bird_y = float(runtime_state['bird_y'])
+        self.bird_velocity = float(runtime_state['bird_velocity'])
+        self.pipe_x = float(runtime_state['pipe_x'])
+        self.pipe_gap_center = float(runtime_state['pipe_gap_center'])
+        self.score = int(runtime_state['score'])
+        self.done = bool(runtime_state['done'])
+        self._scored_current_pipe = bool(runtime_state['_scored_current_pipe'])
+        self.total_raw_env_frames = int(runtime_state['total_raw_env_frames'])
+        self.episode_raw_env_frames = int(runtime_state['episode_raw_env_frames'])
+        self.last_events = dict(runtime_state.get('last_events', {}))
+        self.rng.setstate(runtime_state['rng_state'])
 
     def _get_state(self):
         pipe_top = self.pipe_gap_center - self.PIPE_GAP // 2

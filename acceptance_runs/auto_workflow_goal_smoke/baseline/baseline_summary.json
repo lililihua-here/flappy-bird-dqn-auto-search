@@ -1,0 +1,7 @@
+{
+  "stage": "baseline_check",
+  "status": "failure",
+  "failure_reason": "no_learning_50k",
+  "objective": 198740.0,
+  "history_path": "acceptance_runs/auto_workflow_goal_smoke/baseline/history.jsonl"
+}

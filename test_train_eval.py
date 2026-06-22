@@ -274,8 +274,18 @@ def test_compute_objective_failure_clamped_at_1000():
         max_trial_frames=1_000_000,
         best_eval_score=1000,
     )
-    # Higher eval score -> better (lower) objective
-    assert above < at_limit
+    assert above == at_limit
+
+
+def test_compute_objective_failure_matches_progress_penalty_formula():
+    from train_eval import compute_objective
+    obj = compute_objective(
+        success=False,
+        train_raw_env_frames=1_000_000,
+        max_trial_frames=1_000_000,
+        best_eval_score=500,
+    )
+    assert obj == 1_550_000.0
 
 
 def test_compute_objective_clamps_invalid_failure_score():

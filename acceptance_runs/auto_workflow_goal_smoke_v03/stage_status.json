@@ -1,0 +1,29 @@
+{
+  "baseline_check": {
+    "stage": "baseline_check",
+    "status": "completed",
+    "attempt": 1,
+    "started_at": "2026-06-22T10:01:54",
+    "finished_at": "2026-06-22T10:01:54",
+    "input_hash": "7b4eaa7f9e729573d438195c4ddf622e84de27af4ab245f32388d416d366a722",
+    "output_files": [
+      "acceptance_runs/auto_workflow_goal_smoke_v03/baseline/history.jsonl",
+      "acceptance_runs/auto_workflow_goal_smoke_v03/baseline/baseline_summary.json"
+    ],
+    "history_path": "acceptance_runs/auto_workflow_goal_smoke_v03/baseline/history.jsonl",
+    "summary_path": "acceptance_runs/auto_workflow_goal_smoke_v03/baseline/baseline_summary.json",
+    "error": ""
+  },
+  "protocol_matrix": {
+    "stage": "protocol_matrix",
+    "status": "running",
+    "attempt": 2,
+    "started_at": "2026-06-22T10:03:51",
+    "finished_at": "",
+    "input_hash": "37985045aa4224464d16e0ab37505ef0b3e83f78e479c4a509e4798d975f6c1d",
+    "output_files": [],
+    "history_path": "acceptance_runs/auto_workflow_goal_smoke_v03/protocol_matrix/history.jsonl",
+    "summary_path": "acceptance_runs/auto_workflow_goal_smoke_v03/protocol_matrix/summary.json",
+    "error": ""
+  }
+}

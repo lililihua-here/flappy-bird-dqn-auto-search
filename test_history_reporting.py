@@ -1,4 +1,5 @@
 """Contract tests for history_reporting module."""
+import json
 import numpy as np
 import os
 import sys
@@ -152,6 +153,137 @@ def test_generate_summary_returns_counts_and_best_trial():
         os.unlink(tmp.name)
 
 
+def test_load_raw_trial_rows_filters_non_trial_records(tmp_path):
+    from history_reporting import HistoryManager, load_raw_trial_rows
+
+    history_path = tmp_path / 'history.jsonl'
+    hm = HistoryManager(history_path)
+    hm.append({
+        'trial_id': 1,
+        'status': 'failure',
+        'objective': 999.0,
+        'config': {'lr': 1e-4},
+    })
+    hm.append({
+        'record_type': 'recheck',
+        'trial_id': 1,
+        'recheck_passed': True,
+    })
+
+    rows = load_raw_trial_rows(history_path)
+    assert len(rows) == 1
+    assert rows[0]['trial_id'] == 1
+    assert rows[0]['record_type'] == 'trial'
+
+
+def test_aggregate_trials_for_workflow_keeps_peak_and_final_metrics_separate():
+    from history_reporting import aggregate_trials_for_workflow
+
+    summary = aggregate_trials_for_workflow([
+        {
+            'record_type': 'trial',
+            'trial_id': 1,
+            'status': 'failure',
+            'objective': 1500.0,
+            'best_eval_score': 439,
+            'median_score': 12.0,
+            'success_rate_1000': 0.0,
+            'failure_reason': 'plateau_100k',
+        },
+        {
+            'record_type': 'trial',
+            'trial_id': 2,
+            'status': 'failure',
+            'objective': 1200.0,
+            'best_eval_score': 200,
+            'median_score': 80.0,
+            'success_rate_1000': 0.0,
+            'failure_reason': 'no_learning_50k',
+        },
+        {
+            'record_type': 'trial',
+            'trial_id': 3,
+            'status': 'success',
+            'objective': 800.0,
+            'best_eval_score': 1000,
+            'median_score': 1100.0,
+            'success_rate_1000': 0.8,
+        },
+    ])
+
+    assert summary['trial_count'] == 3
+    assert summary['stable_success_count'] == 1
+    assert summary['best_eval_peak_score'] == 1000
+    assert summary['best_final_median_score'] == 1100.0
+    assert summary['best_final_success_rate_1000'] == 0.8
+    assert summary['median_of_final_medians'] == 80.0
+    assert summary['best_objective'] == 800.0
+    assert summary['plateau_like_count'] == 1
+    assert summary['no_learning_count'] == 1
+    assert summary['failure_reason_counter']['plateau_100k'] == 1
+    assert summary['failure_reason_counter']['no_learning_50k'] == 1
+
+
+def test_workflow_failure_reason_is_normalized():
+    from workflow_metrics import aggregate_trials_for_workflow, normalize_failure_reason
+
+    assert normalize_failure_reason({'status': 'success'}) == 'success'
+    assert normalize_failure_reason({'status': 'failure', 'failure_reason': 'RuntimeError: boom'}) == 'runtime_exception'
+    assert normalize_failure_reason({'status': 'failure', 'failure_reason': 'CUDA out of memory'}) == 'oom_or_resource_error'
+
+    summary = aggregate_trials_for_workflow([
+        {
+            'record_type': 'trial',
+            'trial_id': 1,
+            'status': 'failure',
+            'objective': 1500.0,
+            'median_score': 10.0,
+            'success_rate_1000': 0.0,
+            'best_eval_score': 100.0,
+            'failure_reason': 'RuntimeError: boom',
+        },
+        {
+            'record_type': 'trial',
+            'trial_id': 2,
+            'status': 'failure',
+            'objective': 1800.0,
+            'median_score': 5.0,
+            'success_rate_1000': 0.0,
+            'best_eval_score': 50.0,
+            'failure_reason': 'CUDA out of memory',
+        },
+    ])
+
+    assert summary['failure_reason_counter']['runtime_exception'] == 1
+    assert summary['failure_reason_counter']['oom_or_resource_error'] == 1
+
+
+def test_export_best_config_writes_best_trial_config(tmp_path):
+    from history_reporting import HistoryManager, export_best_config
+
+    history_path = tmp_path / 'history.jsonl'
+    hm = HistoryManager(history_path)
+    hm.append({
+        'trial_id': 1,
+        'status': 'failure',
+        'objective': 2_000_000,
+        'config': {'lr': 1e-4},
+    })
+    hm.append({
+        'trial_id': 2,
+        'status': 'success',
+        'objective': 150000,
+        'config': {'lr': 2e-4, 'reward_scheme_version': 'reward_v3_gap_shaping'},
+    })
+
+    out_path = tmp_path / 'best_config.json'
+    written = export_best_config(hm, out_path)
+
+    assert written == str(out_path)
+    assert out_path.exists()
+    assert '"lr": 0.0002' in out_path.read_text(encoding='utf-8')
+
+
 # ============================================================================
 # _make_serializable tests
 # ============================================================================
@@ -224,6 +356,74 @@ def test_recheck_top_k_persists_full_summary(monkeypatch):
         assert 'failed_seeds' in recheck_rows[0]
     finally:
         os.unlink(tmp.name)
+
+
+def test_recheck_top_k_supports_output_path(monkeypatch, tmp_path):
+    import history_reporting as mod
+    from history_reporting import HistoryManager, recheck_top_k
+
+    history_path = tmp_path / 'history.jsonl'
+    hm = HistoryManager(history_path)
+    hm.append({
+        'trial_id': 9,
+        'status': 'success',
+        'objective': 1000,
+        'config': {'lr': 1e-4},
+        'success_rate_1000': 0.8,
+        'median_score': 1050,
+        'total_raw_env_frames': 120000,
+    })
+
+    fake_results = iter([
+        {
+            'status': 'success',
+            'train_raw_env_frames': 100000,
+            'median_score': 1200,
+            'success_rate_1000': 0.8,
+        },
+    ])
+
+    monkeypatch.setattr(mod, 'run_trial', lambda **kwargs: next(fake_results))
+    output_path = tmp_path / 'recheck_summary.json'
+    recheck_top_k(hm, k=1, recheck_seeds=(101,), output_path=output_path, source='auto_workflow_recheck')
+
+    payload = json.loads(output_path.read_text(encoding='utf-8'))
+    assert payload['k'] == 1
+    assert payload['results'][0]['original_trial_id'] == 9
+
+
+def test_recheck_top_k_supports_output_dir(monkeypatch, tmp_path):
+    import history_reporting as mod
+    from history_reporting import HistoryManager, recheck_top_k
+
+    history_path = tmp_path / 'history.jsonl'
+    hm = HistoryManager(history_path)
+    hm.append({
+        'trial_id': 10,
+        'status': 'success',
+        'objective': 900,
+        'config': {'lr': 1e-4},
+        'success_rate_1000': 0.8,
+        'median_score': 1100,
+        'total_raw_env_frames': 100000,
+    })
+
+    fake_results = iter([
+        {
+            'status': 'success',
+            'train_raw_env_frames': 80000,
+            'median_score': 1300,
+            'success_rate_1000': 0.9,
+        },
+    ])
+
+    monkeypatch.setattr(mod, 'run_trial', lambda **kwargs: next(fake_results))
+    output_dir = tmp_path / 'recheck_out'
+    recheck_top_k(hm, k=1, recheck_seeds=(101,), output_dir=output_dir, source='auto_workflow_recheck')
+
+    payload = json.loads((output_dir / 'recheck_summary.json').read_text(encoding='utf-8'))
+    assert payload['k'] == 1
+    assert payload['results'][0]['original_trial_id'] == 10
 
 
 # ============================================================================

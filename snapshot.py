@@ -16,6 +16,28 @@ SNAPSHOT_INTERVAL = 20_000
 SNAPSHOT_KEEP_LAST_N = 3
 
 
+def _replace_with_retry(src, dst, retries=5, delay_sec=0.05):
+    """Replace a file with small retries for transient Windows file locks."""
+    src_path = Path(src)
+    dst_path = Path(dst)
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            os.replace(str(src_path), str(dst_path))
+            return
+        except PermissionError as exc:
+            last_exc = exc
+            if attempt >= retries - 1:
+                raise
+            if dst_path.exists():
+                try:
+                    dst_path.unlink()
+                except PermissionError:
+                    pass
+            time.sleep(delay_sec * (attempt + 1))
+    raise last_exc
+
+
 @dataclass
 class FullTrainingSnapshot:
     """Complete serialisable training state for deterministic resume."""
@@ -43,6 +65,8 @@ class FullTrainingSnapshot:
     train_updates: int = 0
     local_train_raw_env_frames: int = 0
     lineage_train_raw_env_frames: int = 0
+    env_runtime_state: dict = field(default_factory=dict)
+    training_meta: dict = field(default_factory=dict)
 
     # Replay state
     replay_buffer_type: str = ""
@@ -145,6 +169,7 @@ def capture_snapshot(agent, env, config, trial_id, seed, source, lineage_tracker
         train_updates=lineage_tracker.train_updates,
         local_train_raw_env_frames=lineage_tracker.local_train_raw_env_frames,
         lineage_train_raw_env_frames=lineage_tracker.lineage_train_raw_env_frames,
+        env_runtime_state=env.capture_runtime_state(),
         config=config,
         state_representation_version=config.get("state_representation_version", "low_dim_v1"),
         reward_scheme_version=config.get("reward_scheme_version", "reward_v1_sparse"),
@@ -213,8 +238,8 @@ def save_snapshot(snapshot, checkpoint_dir):
     file_sha = hashlib.sha256(tmp_pt.read_bytes()).hexdigest()
     tmp_sha.write_text(file_sha, encoding="utf-8")
 
-    os.replace(str(tmp_pt), str(final_pt))
-    os.replace(str(tmp_sha), str(final_sha))
+    _replace_with_retry(tmp_pt, final_pt)
+    _replace_with_retry(tmp_sha, final_sha)
 
     prune_old_snapshots(checkpoint_dir, snapshot.trial_id)
 
@@ -265,6 +290,7 @@ def restore_snapshot_to_agent(snapshot, agent):
     agent.optimizer.load_state_dict(snapshot.optimizer_state_dict)
     agent.epsilon = snapshot.epsilon
     agent.decision_steps = snapshot.decision_steps
+    agent.train_updates = snapshot.train_updates
     return agent
 
 
@@ -351,3 +377,33 @@ def restore_lineage_from_snapshot(snapshot):
     lineage.lineage_train_raw_env_frames = snapshot.lineage_train_raw_env_frames
     lineage.train_updates = snapshot.train_updates
     return lineage
+
+
+def load_agent_and_encoder_from_snapshot(path, device=None):
+    """Load a V3 snapshot into an inference-ready agent and matching encoder."""
+    from dqn_agent import DQNAgent
+    from state_encoder_variants import get_encoder
+
+    snapshot = load_snapshot(path)
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    encoder = get_encoder(
+        snapshot.state_representation_version,
+        env_config={
+            "SCREEN_WIDTH": snapshot.config.get("SCREEN_WIDTH", 600),
+            "SCREEN_HEIGHT": snapshot.config.get("SCREEN_HEIGHT", 800),
+            "MAX_FALL_SPEED": snapshot.config.get("MAX_FALL_SPEED", 10),
+            "BIRD_X": snapshot.config.get("BIRD_X", 100),
+        },
+    )
+    agent = DQNAgent(
+        config=dict(snapshot.config),
+        state_dim=encoder.state_dim,
+        n_actions=2,
+        device=device,
+    )
+    restore_snapshot_to_agent(snapshot, agent)
+    agent.buffer = restore_replay_buffer(snapshot, snapshot.config)
+    agent.q_net.eval()
+    agent.target_net.eval()
+    return agent, encoder, snapshot

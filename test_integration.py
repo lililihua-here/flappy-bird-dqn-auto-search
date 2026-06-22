@@ -44,3 +44,16 @@ def test_compat_shim_runs_baseline():
     )
     assert result.returncode == 0
     assert '--baseline-only' in result.stdout
+
+
+def test_main_help_includes_v3_cli_flags():
+    result = subprocess.run(
+        [sys.executable, 'main.py', '--help'],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0
+    assert '--search-strategy' in result.stdout
+    assert '--resume' in result.stdout
+    assert '--recheck-topk' in result.stdout
+    assert '--final-confirm' in result.stdout
+    assert '--matrix' in result.stdout

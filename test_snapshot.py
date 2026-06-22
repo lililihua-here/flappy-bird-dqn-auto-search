@@ -53,6 +53,53 @@ def test_snapshot_save_load_roundtrip(tmp_path):
     assert loaded.trial_id == 0
 
 
+def test_snapshot_save_twice_same_name_does_not_fail_or_leave_tmp(tmp_path):
+    import os
+    from snapshot import FullTrainingSnapshot, save_snapshot, load_snapshot
+
+    s1 = FullTrainingSnapshot(trial_id=7, seed=1, decision_steps=20000, q_net_state_dict={})
+    s2 = FullTrainingSnapshot(
+        trial_id=7,
+        seed=1,
+        decision_steps=20000,
+        q_net_state_dict={},
+        training_meta={'final_eval_done': True},
+    )
+
+    path1, sha1 = save_snapshot(s1, str(tmp_path))
+    path2, sha2 = save_snapshot(s2, str(tmp_path))
+
+    assert path1 == path2
+    assert os.path.exists(path2)
+    assert not os.path.exists(path2 + '.tmp')
+    assert not os.path.exists(path2.replace('.pt', '.sha256.tmp'))
+
+    loaded = load_snapshot(path2)
+    assert loaded.training_meta.get('final_eval_done') is True
+
+
+def test_snapshot_save_retries_when_replace_temporarily_denied(tmp_path, monkeypatch):
+    from snapshot import FullTrainingSnapshot, save_snapshot
+    import snapshot as snapshot_mod
+
+    original_replace = snapshot_mod.os.replace
+    calls = {'count': 0}
+
+    def flaky_replace(src, dst):
+        if dst.endswith('snapshot_8_20000.pt') and calls['count'] == 0:
+            calls['count'] += 1
+            raise PermissionError(5, 'Access is denied', dst)
+        return original_replace(src, dst)
+
+    monkeypatch.setattr(snapshot_mod.os, 'replace', flaky_replace)
+
+    s = FullTrainingSnapshot(trial_id=8, seed=1, decision_steps=20000, q_net_state_dict={})
+    path, _sha = save_snapshot(s, str(tmp_path))
+
+    assert path.endswith('snapshot_8_20000.pt')
+    assert calls['count'] == 1
+
+
 def test_snapshot_missing_sha_rejected(tmp_path):
     from snapshot import FullTrainingSnapshot, save_snapshot
     import torch
